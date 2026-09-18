@@ -43,6 +43,9 @@ pub struct FlatOptions {
     /// Mirror-average around the vertical center axis. Garments are
     /// symmetric; this removes asymmetric wrinkles/shadows.
     pub symmetrize: bool,
+    /// Mirror the detail linework too. Off by default: asymmetric details
+    /// (chest logos, pockets) must stay where they are, not be duplicated.
+    pub symmetrize_lines: bool,
     /// Outline stroke width in px on the silhouette path.
     pub outline_width: f32,
     /// 0..=1. Higher keeps weaker lines (fabric folds); lower keeps only
@@ -57,6 +60,7 @@ impl Default for FlatOptions {
         Self {
             input: FlatInput::FlatLay,
             symmetrize: true,
+            symmetrize_lines: false,
             outline_width: 2.0,
             detail_strength: 0.6,
             speckle: 4,
@@ -95,6 +99,7 @@ pub fn convert_flat_bytes(bytes: &[u8], opts: &FlatOptions) -> Result<FlatOutput
     if opts.input == FlatInput::OnModel {
         bail!("on-model photos need the Phase-2 ML segmenter (segformer clothes, ONNX) which is not bundled yet — use flat-lay / ghost-mannequin photos for now");
     }
+    let t0 = Instant::now();
     let img = image::load_from_memory(bytes).context("decode image (png/jpg/webp/...)")?;
     let mut rgb = img.to_rgb8();
     if rgb.width().max(rgb.height()) > MAX_SIDE {
@@ -103,12 +108,12 @@ pub fn convert_flat_bytes(bytes: &[u8], opts: &FlatOptions) -> Result<FlatOutput
             (rgb.width() as f32 * scale).round() as u32,
             (rgb.height() as f32 * scale).round() as u32,
         );
-        rgb = image::imageops::resize(
-            &rgb,
-            nw.max(1),
-            nh.max(1),
-            image::imageops::FilterType::Triangle,
-        );
+        // Area-average downscale: the generic Triangle resize costs ~2s
+        // at 5MP; this is O(n) with better reduction quality than Nearest.
+        rgb = downscale_area(&rgb, nw.max(1), nh.max(1));
+    }
+    if std::env::var("IM2VEC_FLAT_DEBUG").is_ok() {
+        eprintln!("decode+resize: {} ms", t0.elapsed().as_millis());
     }
     convert_flat_rgb(&rgb, opts)
 }
@@ -147,16 +152,17 @@ fn convert_flat_rgb(rgb: &RgbImage, opts: &FlatOptions) -> Result<FlatOutput> {
         })
         .collect();
 
-    // 3. detail pass: XDoG lines inside (slightly dilated) garment region.
+    // 3. detail pass: XDoG lines strictly inside the garment. The region is
+    // eroded so inner lines never hug (and double) the silhouette outline.
     let t = Instant::now();
-    let region = dilate(&mask, w, h, 2);
+    let region = erode(&mask, w, h, 2);
     let mut lines = xdog_lines(&lum, w, h, opts.detail_strength);
     for (i, v) in lines.iter_mut().enumerate() {
         if !region[i] {
             *v = 255;
         }
     }
-    if opts.symmetrize {
+    if opts.symmetrize_lines {
         symmetrize_gray_max(&mut lines, w, h);
     }
     stage(&mut stages, "XDoG linework", t);
@@ -385,48 +391,154 @@ fn symmetrize_gray_max(g: &mut [u8], w: u32, h: u32) {
     }
 }
 
-fn dilate(mask: &[bool], w: u32, h: u32, r: usize) -> Vec<bool> {
+/// Area-average downscale for large inputs.
+fn downscale_area(rgb: &RgbImage, nw: u32, nh: u32) -> RgbImage {
+    use image::Rgb;
+    let (sw, sh) = (rgb.width() as usize, rgb.height() as usize);
+    let (nw, nh) = (nw as usize, nh as usize);
+    let src = rgb.as_raw();
+    let mut out = RgbImage::new(nw as u32, nh as u32);
+    for y in 0..nh {
+        let y0 = y * sh / nh;
+        let y1 = ((y + 1) * sh / nh).max(y0 + 1);
+        for x in 0..nw {
+            let x0 = x * sw / nw;
+            let x1 = ((x + 1) * sw / nw).max(x0 + 1);
+            let (mut r, mut g, mut b, mut n) = (0u32, 0u32, 0u32, 0u32);
+            for sy in y0..y1 {
+                for sx in x0..x1 {
+                    let i = (sy * sw + sx) * 3;
+                    r += src[i] as u32;
+                    g += src[i + 1] as u32;
+                    b += src[i + 2] as u32;
+                    n += 1;
+                }
+            }
+            out.put_pixel(
+                x as u32,
+                y as u32,
+                Rgb([(r / n) as u8, (g / n) as u8, (b / n) as u8]),
+            );
+        }
+    }
+    out
+}
+
+fn erode(mask: &[bool], w: u32, h: u32, r: usize) -> Vec<bool> {
     let (w, h) = (w as usize, h as usize);
     let mut out = vec![false; w * h];
     for y in 0..h {
         for x in 0..w {
-            if !mask[y * w + x] {
-                continue;
-            }
             let y0 = y.saturating_sub(r);
             let y1 = (y + r + 1).min(h);
             let x0 = x.saturating_sub(r);
             let x1 = (x + r + 1).min(w);
+            let mut all = true;
             for yy in y0..y1 {
                 for xx in x0..x1 {
-                    out[yy * w + xx] = true;
+                    if !mask[yy * w + xx] {
+                        all = false;
+                        break;
+                    }
+                }
+                if !all {
+                    break;
                 }
             }
+            out[y * w + x] = all;
         }
     }
     out
+}
+
+/// Gaussian blur, pyramidal for large sigmas: blur at half resolution and
+/// upscale. ~4x faster per level with negligible effect on XDoG output.
+fn fast_blur(gray: &GrayImage, sigma: f32) -> GrayImage {
+    if sigma <= 2.0 {
+        return gauss_blur(gray, sigma);
+    }
+    let (w, h) = (gray.width().max(2), gray.height().max(2));
+    let small = image::imageops::resize(gray, w / 2, h / 2, image::imageops::FilterType::Nearest);
+    let blurred = gauss_blur(&small, sigma / 2.0);
+    image::imageops::resize(&blurred, w, h, image::imageops::FilterType::Nearest)
+}
+
+/// Separable Gaussian blur with truncated kernel. (The generic ops blur was
+/// the pipeline bottleneck at ~1.6s per conversion; this is milliseconds.)
+fn gauss_blur(gray: &GrayImage, sigma: f32) -> GrayImage {
+    let (w, h) = (gray.width() as usize, gray.height() as usize);
+    let r = ((sigma * 3.0).ceil() as usize).max(1);
+    let mut k = Vec::with_capacity(2 * r + 1);
+    let mut sum = 0.0f32;
+    for i in -(r as i32)..=r as i32 {
+        let v = (-(i * i) as f32 / (2.0 * sigma * sigma)).exp();
+        k.push(v);
+        sum += v;
+    }
+    for v in k.iter_mut() {
+        *v /= sum;
+    }
+    let src = gray.as_raw();
+    let mut tmp = vec![0u8; w * h];
+    for y in 0..h {
+        for x in 0..w {
+            let mut acc = 0.0f32;
+            for (j, &kv) in k.iter().enumerate() {
+                let xx = (x as i32 + j as i32 - r as i32).clamp(0, w as i32 - 1) as usize;
+                acc += src[y * w + xx] as f32 * kv;
+            }
+            tmp[y * w + x] = acc.round().clamp(0.0, 255.0) as u8;
+        }
+    }
+    let mut out = vec![0u8; w * h];
+    for y in 0..h {
+        for x in 0..w {
+            let mut acc = 0.0f32;
+            for (j, &kv) in k.iter().enumerate() {
+                let yy = (y as i32 + j as i32 - r as i32).clamp(0, h as i32 - 1) as usize;
+                acc += tmp[yy * w + x] as f32 * kv;
+            }
+            out[y * w + x] = acc.round().clamp(0.0, 255.0) as u8;
+        }
+    }
+    GrayImage::from_raw(w as u32, h as u32, out).expect("blur size")
 }
 
 /// Extended Difference-of-Gaussians: dark stylized lines on white.
 /// `strength` 0..=1 maps to the epsilon threshold (lower eps = more lines).
 fn xdog_lines(lum: &[f32], w: u32, h: u32, strength: f32) -> Vec<u8> {
     let (wu, hu) = (w as usize, h as usize);
-    let raw: Vec<u8> = lum
-        .iter()
-        .map(|&v| (v.clamp(0.0, 1.0) * 255.0) as u8)
-        .collect();
-    let gray = GrayImage::from_raw(w, h, raw).expect("gray buffer size");
+    // Compute the response at reduced resolution (edges survive downscaling)
+    // with hand-rolled sampling: the generic ops resize is ~1s at 2MP.
     let sigma = 1.4f32;
-    let b1 = image::imageops::blur(&gray, sigma);
-    let b2 = image::imageops::blur(&gray, sigma * 4.0);
+    let scale = (800.0 / w.max(h) as f32).min(1.0);
+    let (sw, sh) = (
+        ((w as f32 * scale).round() as u32).max(1),
+        ((h as f32 * scale).round() as u32).max(1),
+    );
+    let debug = std::env::var("IM2VEC_FLAT_DEBUG").is_ok();
+    let t = Instant::now();
+    let small = sample_gray(lum, wu, hu, sw, sh);
+    let b1 = fast_blur(&small, sigma * scale);
+    let b2 = fast_blur(&small, sigma * 4.0 * scale);
+    if debug {
+        eprintln!(
+            "xdog blurs: {} ms ({}x{} scale {scale:.2})",
+            t.elapsed().as_millis(),
+            w,
+            h
+        );
+    }
     let tau = 0.98f32;
     let phi = 20.0f32;
     // eps window is tight: interior DoG floor sits near +0.01, so eps must
     // stay negative; -0.15 keeps only the strongest edges, -0.008 everything.
     let eps = (-0.15 + 0.20 * strength.clamp(0.0, 1.0)).min(-0.008);
-    let mut out = vec![255u8; wu * hu];
-    for (i, o) in out.iter_mut().enumerate() {
-        let d = b1.as_raw()[i] as f32 / 255.0 - tau * b2.as_raw()[i] as f32 / 255.0;
+    let (swu, shu) = (sw as usize, sh as usize);
+    let (rb1, rb2) = (b1.as_raw(), b2.as_raw());
+    let mut small_out = vec![255u8; swu * shu];
+    for (i, o) in small_out.iter_mut().enumerate() {
+        let d = rb1[i] as f32 / 255.0 - tau * rb2[i] as f32 / 255.0;
         // XDoG soft threshold: values below eps become dark lines.
         let v = if d >= eps {
             1.0
@@ -436,8 +548,38 @@ fn xdog_lines(lum: &[f32], w: u32, h: u32, strength: f32) -> Vec<u8> {
         *o = (v.clamp(0.0, 1.0) * 255.0) as u8;
     }
     // Binarize for a clean trace: lines black, rest white.
-    for v in out.iter_mut() {
+    for v in small_out.iter_mut() {
         *v = if *v < 235 { 0 } else { 255 };
+    }
+    if sw == w && sh == h {
+        return small_out;
+    }
+    upscale_nearest_u8(&small_out, sw, sh, w, h)
+}
+
+/// Nearest-sample a u8 gray image straight from the float luminance buffer.
+fn sample_gray(lum: &[f32], w: usize, h: usize, sw: u32, sh: u32) -> GrayImage {
+    let (sw, sh) = (sw as usize, sh as usize);
+    let mut raw = vec![0u8; sw * sh];
+    for y in 0..sh {
+        let sy = (y * h / sh).min(h - 1);
+        for x in 0..sw {
+            let sx = (x * w / sw).min(w - 1);
+            raw[y * sw + x] = (lum[sy * w + sx].clamp(0.0, 1.0) * 255.0) as u8;
+        }
+    }
+    GrayImage::from_raw(sw as u32, sh as u32, raw).expect("small gray")
+}
+
+/// Nearest-upscale a u8 buffer (fast path around the slow generic resize).
+fn upscale_nearest_u8(src: &[u8], sw: u32, sh: u32, w: u32, h: u32) -> Vec<u8> {
+    let (sw, sh, w, h) = (sw as usize, sh as usize, w as usize, h as usize);
+    let mut out = vec![0u8; w * h];
+    for y in 0..h {
+        let sy = (y * sh / h).min(sh - 1);
+        for x in 0..w {
+            out[y * w + x] = src[sy * sw + (x * sw / w).min(sw - 1)];
+        }
     }
     out
 }
@@ -564,6 +706,22 @@ mod tests {
             }
         }
         assert!(m[8], "speck mirrored to top-right");
+    }
+
+    #[test]
+    fn erode_shrinks_by_radius() {
+        // 5x5 solid block in 9x9: radius-1 erosion leaves the inner 3x3.
+        let mut m = vec![false; 81];
+        for y in 2..7 {
+            for x in 2..7 {
+                m[y * 9 + x] = true;
+            }
+        }
+        let e = erode(&m, 9, 9, 1);
+        assert!(e[4 * 9 + 4], "center survives");
+        assert!(!e[2 * 9 + 2], "original corner eaten");
+        assert!(!e[0], "outside stays out");
+        assert_eq!(e.iter().filter(|&&b| b).count(), 9);
     }
 
     #[test]

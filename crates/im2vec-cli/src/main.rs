@@ -68,6 +68,9 @@ struct Args {
     /// flat preset only: mirror-average around the vertical center axis
     #[arg(long, default_value_t = true)]
     symmetrize: bool,
+    /// flat preset only: also mirror the detail linework (off: logos/pockets stay put)
+    #[arg(long, default_value_t = false)]
+    symmetrize_lines: bool,
     /// flat preset only: silhouette outline stroke width in px
     #[arg(long, default_value_t = 2.0)]
     outline_width: f32,
@@ -87,6 +90,7 @@ fn main() -> Result<()> {
         let flat = im2vec_flat::FlatOptions {
             input: im2vec_flat::FlatInput::parse(&args.flat_input),
             symmetrize: args.symmetrize,
+            symmetrize_lines: args.symmetrize_lines,
             outline_width: args.outline_width,
             detail_strength: args.detail_strength,
             speckle: args.filter_speckle,
