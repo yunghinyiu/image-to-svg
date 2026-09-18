@@ -215,15 +215,12 @@ pub fn search_lapel(vg_default: f32, vb: f32, frame: &Placement, edges: &EdgeMap
 }
 
 /// Grid-search the pocket flap Y, shared by both flaps to preserve symmetry.
-/// `left_ax` / `right_ax` are the photo-measured flap centers (from
-/// [`crate::detect::detect_pocket_flaps`]); the search only moves Y.
 /// Returns the winning `ay`, or `ay_default` when no candidate is clearly
 /// better.
 pub fn search_pocket_y(
     ay_default: f32,
     pocket: &Template,
-    left_ax: f32,
-    right_ax: f32,
+    cx: f32,
     w: f32,
     h: f32,
     edges: &EdgeMap,
@@ -231,14 +228,14 @@ pub fn search_pocket_y(
     let score = |ay: f32| -> f32 {
         let placements = [
             Placement {
-                ax: left_ax,
+                ax: cx - 0.25 * w,
                 ay,
                 w,
                 h,
                 mirror: false,
             },
             Placement {
-                ax: right_ax,
+                ax: cx + 0.25 * w,
                 ay,
                 w,
                 h,
@@ -351,14 +348,14 @@ mod tests {
     fn search_pocket_y_snaps_to_synthetic_edge() {
         // Pocket-style line template; edge at y=120 across both flap sites.
         let edges = EdgeMap::from_chains(&hline_edge(120.0), 400, 300);
-        let won = search_pocket_y(104.0, &hline_template(), 100.0, 300.0, 400.0, 200.0, &edges);
+        let won = search_pocket_y(104.0, &hline_template(), 200.0, 400.0, 200.0, &edges);
         assert!((won - 120.0).abs() < 1e-4, "won {won}, want 120");
     }
 
     #[test]
     fn search_pocket_y_falls_back_without_edges() {
         let edges = EdgeMap::from_chains(&[], 400, 300);
-        let won = search_pocket_y(104.0, &hline_template(), 100.0, 300.0, 400.0, 200.0, &edges);
+        let won = search_pocket_y(104.0, &hline_template(), 200.0, 400.0, 200.0, &edges);
         assert!((won - 104.0).abs() < 1e-4, "won {won}, want default 104");
     }
 
@@ -366,7 +363,7 @@ mod tests {
     fn search_pocket_y_falls_back_on_weak_evidence() {
         // Edge 40px away: no candidate reaches it; the default must stand.
         let edges = EdgeMap::from_chains(&hline_edge(200.0), 400, 300);
-        let won = search_pocket_y(104.0, &hline_template(), 100.0, 300.0, 400.0, 200.0, &edges);
+        let won = search_pocket_y(104.0, &hline_template(), 200.0, 400.0, 200.0, &edges);
         assert!((won - 104.0).abs() < 1e-4, "won {won}, want default 104");
     }
 
