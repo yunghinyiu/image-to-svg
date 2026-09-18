@@ -216,58 +216,63 @@ fn rounded_rect_uv(
 /// reference tech pack: notch at 0.14w, peak at 0.25w / 0.24h, break at
 /// 0.09w; dashed topstitching inset 9px; roll line from neck to button.
 pub fn lapel_template(vg: f32, vb: f32) -> Template {
-    lapel_template_with_peak(vg, vb, 0.30f32)
+    lapel_template_with_peak(vg, vb, 0.28f32)
 }
 
 /// Lapel template with explicit peak x position (for curvature-snapped placement).
 /// `peak_x` is the normalized x offset from center (0.30 = wide angular lapel).
 pub fn lapel_template_with_peak(vg: f32, vb: f32, peak_x: f32) -> Template {
-    // #33: peak placed relative to the notch (vg), not at a fixed v.
-    // Photo-measured (blazer): peak sits ~0.05w outboard and ~0.03h below the
-    // notch; the old fixed (0.25, 0.24) put it ~50px too low and too far out,
-    // rendering a rounded shield instead of a sharp peak lapel.
-    // Target-measured: peak is WIDE at 0.30w outboard (not 0.19w) for the
-    // broad angular lapel; notch at 0.14w where collar meets lapel.
-    let notch = (0.14f32, vg);
-    let peak = (peak_x, vg + 0.020f32);
-    let brk = (0.12f32, vb);
-    // Peak -> break: STRAIGHT line for sharp angular peak lapel.
-    // The target shows a crisp triangle, not a rounded shield.
-    // (Old cubic curve rendered a rounded shield; removed per target.)
-    // Roll line: the V from neck to button. Target shows it nearly vertical,
-    // ending at the top button.
-    let roll = vec![
-        TPoint::Norm(0.10, vg + 0.01),
-        TPoint::Norm(0.08, (vg + vb) * 0.5),
-        TPoint::NormPx(0.06, vb, 0.0, -4.0),
-    ];
+    // Notched lapel geometry (target-measured):
+    // - Gorge: where collar meets lapel at center front
+    // - Notch: V-shaped cutout between collar and lapel (the "step")
+    // - Peak: outermost point, juts OUTWARD from the notch
+    // - Break: where lapel meets the front edge at button level
+    //
+    // The target shows a distinct notch step, not a smooth V. The peak
+    // points outward (horizontally), not downward.
+    let gorge = (0.08f32, vg);
+    let notch_inner = (0.10f32, vg); // Notch start (horizontal)
+    let notch_outer = (0.18f32, vg + 0.002f32); // Notch end (horizontal step)
+    let peak = (peak_x, vg + 0.022f32); // Slightly below notch (flat shelf)
+    let brk = (0.10f32, vb); // Meets front edge
+                             // (Old cubic curve rendered a rounded shield; removed per target.)
     Template {
         name: "lapel",
         paths: vec![
-            // Outer edge: notch -> peak (straight). Sharp angle at notch
-            // where collar overlaps.
+            // Gorge: collar meets lapel (horizontal seam).
             TPath::solid(vec![
-                TPoint::Norm(notch.0, notch.1),
+                TPoint::Norm(gorge.0, gorge.1),
+                TPoint::Norm(notch_inner.0, notch_inner.1),
+            ]),
+            // Notch V-cut: inner -> outer (the step).
+            TPath::solid(vec![
+                TPoint::Norm(notch_inner.0, notch_inner.1),
+                TPoint::Norm(notch_outer.0, notch_outer.1),
+            ]),
+            // Lapel top edge: notch outer -> peak (juts outward).
+            TPath::solid(vec![
+                TPoint::Norm(notch_outer.0, notch_outer.1),
                 TPoint::Norm(peak.0, peak.1),
             ]),
-            // Outer edge: peak -> break (curve). Sharp corner at the peak
-            // for the notch-lapel point.
-            // Outer edge: peak -> break (STRAIGHT for sharp angular lapel).
+            // Lapel outer edge: peak -> break (straight, angular).
             TPath::solid(vec![
                 TPoint::Norm(peak.0, peak.1),
                 TPoint::Norm(brk.0, brk.1),
             ]),
-            // Dashed topstitching parallel to the outer edge, inset 9px.
+            // Dashed topstitching parallel to lapel edges, inset 9px.
             TPath::dashed(vec![
-                TPoint::NormPx(notch.0, notch.1, -9.0, 2.0),
+                TPoint::NormPx(notch_outer.0, notch_outer.1, -9.0, 2.0),
                 TPoint::NormPx(peak.0, peak.1, -9.0, 0.0),
             ]),
             TPath::dashed(vec![
                 TPoint::NormPx(peak.0, peak.1, -9.0, 0.0),
                 TPoint::NormPx(brk.0, brk.1, -9.0, 0.0),
             ]),
-            // Roll line.
-            TPath::solid(roll),
+            // Roll line: notch inner -> break (the V opening).
+            TPath::solid(vec![
+                TPoint::Norm(notch_inner.0, notch_inner.1),
+                TPoint::Norm(brk.0, brk.1),
+            ]),
         ],
     }
 }
@@ -526,13 +531,15 @@ mod tests {
 
     #[test]
     fn lapel_template_has_expected_path_count() {
-        // 2 solid outer + 2 dashed stitching + 1 solid roll = 5 paths.
+        // Notched lapel: 4 solid (gorge, notch V, top edge, outer edge)
+        // + 2 dashed stitching + 1 solid roll = 7 paths.
         let t = lapel_template(0.09, 0.4);
-        assert_eq!(t.paths.len(), 5);
+        assert_eq!(t.paths.len(), 7);
         assert_eq!(t.paths.iter().filter(|p| p.dashed).count(), 2);
-        // Angular lapel: straight lines have 2 points each (not sampled curves).
-        assert_eq!(t.paths[1].points.len(), 2);
-        assert_eq!(t.paths[3].points.len(), 2);
+        // Angular lapel: straight lines have 2 points each.
+        for p in &t.paths {
+            assert_eq!(p.points.len(), 2);
+        }
     }
 
     #[test]

@@ -2408,17 +2408,16 @@ fn generate_structure(
         // The template's fixed fractions are a starting guess; the curvature
         // map reveals where the folds actually are in this garment.
         let (vg_snap, peak_x_snap) = {
-            let notch_px = (cx + 0.14 * w, y0 + vg * h);
-            let peak_px = (cx + 0.30 * w, y0 + (vg + 0.020) * h);
+            let notch_px = (cx + 0.11 * w, y0 + vg * h);
             let (_nx, ny) = curvature_map.snap_to_ridge(notch_px.0, notch_px.1, 25.0, 0.3);
-            let (px, py) = curvature_map.snap_to_ridge(peak_px.0, peak_px.1, 30.0, 0.3);
-            // Convert back to normalized: vg from snapped notch y, peak_x from snapped peak x.
+            // Convert back to normalized: vg from snapped notch y.
             let vg_s = (ny - y0) / h;
-            let peak_x_s = ((px - cx) / w).abs().max(0.20).min(0.40);
+            // Peak x: use fixed 0.28 (target-measured compact lapel). Curvature
+            // snaps inward to the roll fold, not the outer peak edge.
+            let peak_x_s = 0.28f32;
+            eprintln!("[lapel-snap] vg {:.3}->{:.3} peak_x fixed 0.28", vg, vg_s);
             // Only accept the snap if it's within reasonable bounds of the default.
             let vg_final = if (vg_s - vg).abs() < 0.05 { vg_s } else { vg };
-            // Peak y should stay near vg; use snapped x but keep y relationship.
-            let _ = py; // peak y snap unused for now; x is the critical fix
             (vg_final, peak_x_s)
         };
         let lapel = lapel_template_with_peak(vg_snap, vb, peak_x_snap);
