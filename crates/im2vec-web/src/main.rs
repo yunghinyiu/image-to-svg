@@ -60,6 +60,7 @@ async fn api_convert(mut mp: Multipart) -> Result<Json<ConvertResponse>, (Status
     let mut preset_raw = String::from("logo");
     let mut flat_input = String::from("flatlay");
     let mut detail_strength = 0.6f32;
+    let mut stitch_dashes = false;
 
     while let Some(field) = mp
         .next_field()
@@ -83,6 +84,9 @@ async fn api_convert(mut mp: Multipart) -> Result<Json<ConvertResponse>, (Status
                 if let Ok(v) = text.trim().parse() {
                     detail_strength = v;
                 }
+            }
+            "stitch_dashes" => {
+                stitch_dashes = matches!(text.trim(), "dashed" | "true" | "1");
             }
             "mode" => opts.mode = text.trim().to_string(),
             "hierarchical" => opts.hierarchical = text.trim().to_string(),
@@ -152,6 +156,7 @@ async fn api_convert(mut mp: Multipart) -> Result<Json<ConvertResponse>, (Status
                     symmetrize_lines: false,
                     outline_width: 2.0,
                     detail_strength,
+                    stitch_dashed: stitch_dashes,
                     speckle,
                 },
             )
@@ -277,6 +282,7 @@ const INDEX_HTML: &str = r#"<!doctype html>
     </select>
     <div class="row">
       <div><label>Photo type (flat preset)</label><select id="flat_input"><option value="flatlay" selected>flat-lay / ghost mannequin</option><option value="on-model" disabled>on-model — Phase 2</option></select></div>
+      <div><label>Details (flat)</label><select id="stitch_dashes"><option value="solid" selected>solid — seams</option><option value="dashed">dashed — stitching</option></select></div>
     </div>
     <div class="row">
       <div><label>Mode</label><select id="mode"><option value="spline" selected>spline</option><option value="polygon">polygon</option><option value="pixel">pixel</option></select></div>
@@ -384,6 +390,7 @@ async function convert() {
   fd.append('file', f, currentName || 'image.png');
   fd.append('preset', $('preset').value);
   fd.append('flat_input', $('flat_input').value);
+  fd.append('stitch_dashes', $('stitch_dashes').value);
   fd.append('mode', $('mode').value);
   fd.append('hierarchical', $('hierarchical').value);
   fd.append('filter_speckle', $('filter_speckle').value);
@@ -435,7 +442,7 @@ function renderPipeline(j){
   $('thumbs').innerHTML = h;
   const preset = $('preset').value;
   $('params').textContent = preset === 'flat'
-    ? 'flatlay · symmetrized · outline 2.0px · detail ' + ($('detail_strength').value/10).toFixed(1)
+    ? 'flatlay · symmetrized · outline 2.0px · detail ' + ($('detail_strength').value/10).toFixed(1) + ' · ' + $('stitch_dashes').value
     : `${preset} · ${$('mode').value} · ${$('hierarchical').value} · ${$('clustering').value}`;
 }
 $('go').onclick = convert;

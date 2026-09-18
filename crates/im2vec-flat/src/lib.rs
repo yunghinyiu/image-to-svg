@@ -46,6 +46,9 @@ pub struct FlatOptions {
     /// Mirror the detail linework too. Off by default: asymmetric details
     /// (chest logos, pockets) must stay where they are, not be duplicated.
     pub symmetrize_lines: bool,
+    /// Render inner details as dashed stitch strokes (factory convention:
+    /// solid = seam, dashed = stitching). Off = solid uniform strokes.
+    pub stitch_dashed: bool,
     /// Outline stroke width in px on the silhouette path.
     pub outline_width: f32,
     /// 0..=1. Higher keeps weaker lines (fabric folds); lower keeps only
@@ -61,6 +64,7 @@ impl Default for FlatOptions {
             input: FlatInput::FlatLay,
             symmetrize: true,
             symmetrize_lines: false,
+            stitch_dashed: false,
             outline_width: 2.0,
             detail_strength: 0.6,
             speckle: 4,
@@ -152,11 +156,15 @@ fn convert_flat_rgb(rgb: &RgbImage, opts: &FlatOptions) -> Result<FlatOutput> {
         })
         .collect();
 
-    // 3. detail pass: XDoG lines strictly inside the garment. The region is
-    // eroded so inner lines never hug (and double) the silhouette outline.
+    // 3. detail pass: XDoG response -> skeleton centerlines -> polylines.
+    // Chains deep inside the garment survive (drops boundary-hugging echo
+    // chains that would double the silhouette); survivors draw as uniform
+    // stroked paths.
     let t = Instant::now();
     let region = erode(&mask, w, h, 2);
-    let mut lines = xdog_lines(&lum, w, h, opts.detail_strength);
+    let deep = erode(&mask, w, h, 4);
+    let mut xd = xdog_lines(&lum, w, h, opts.detail_strength);
+    let mut lines = xd.full.clone();
     for (i, v) in lines.iter_mut().enumerate() {
         if !region[i] {
             *v = 255;
@@ -164,13 +172,28 @@ fn convert_flat_rgb(rgb: &RgbImage, opts: &FlatOptions) -> Result<FlatOutput> {
     }
     if opts.symmetrize_lines {
         symmetrize_gray_max(&mut lines, w, h);
+        for c in xd.chains.iter_mut() {
+            for p in c.iter_mut() {
+                p.0 = xd.sw as f32 - 1.0 - p.0;
+            }
+        }
     }
+    let (wu, hu) = (w as usize, h as usize);
+    xd.chains.retain(|c| {
+        if c.is_empty() {
+            return false;
+        }
+        let inside = c
+            .iter()
+            .filter(|&&(px, py)| {
+                let fx = ((px + 0.5) * w as f32 / xd.sw as f32) as usize;
+                let fy = ((py + 0.5) * h as f32 / xd.sh as f32) as usize;
+                fx < wu && fy < hu && deep[fy * wu + fx]
+            })
+            .count();
+        inside * 4 >= c.len() * 3
+    });
     stage(&mut stages, "XDoG linework", t);
-    let t = Instant::now();
-    let det_img = gray_to_color(&lines, w, h);
-    let det = convert_image(&det_img, w, h, &trace_opts(opts.speckle, 1.0))?;
-    stage(&mut stages, "trace details", t);
-    let det_paths = extract_paths(&det.svg);
 
     // 4. compose one flat-style SVG.
     if std::env::var("IM2VEC_FLAT_DEBUG").is_ok() {
@@ -194,10 +217,31 @@ fn convert_flat_rgb(rgb: &RgbImage, opts: &FlatOptions) -> Result<FlatOutput> {
     for p in &styled_sil {
         svg.push_str(p);
     }
-    svg.push_str("</g><g id=\"details\">");
-    let n_det = det_paths.len();
-    for p in &det_paths {
-        svg.push_str(p);
+    svg.push_str("</g>");
+    svg.push_str(&format!(
+        "<g id=\"details\" fill=\"none\" stroke=\"#1a1a1a\" stroke-width=\"2\" stroke-linecap=\"round\" stroke-linejoin=\"round\"{}>",
+        if opts.stitch_dashed {
+            " stroke-dasharray=\"7 4\""
+        } else {
+            ""
+        }
+    ));
+    let (sxx, syy) = (w as f32 / xd.sw as f32, h as f32 / xd.sh as f32);
+    let mut n_det = 0;
+    for c in &xd.chains {
+        if c.len() < 2 {
+            continue;
+        }
+        n_det += 1;
+        svg.push_str(&format!(
+            "<path d=\"M{:.1},{:.1}",
+            c[0].0 * sxx,
+            c[0].1 * syy
+        ));
+        for &(px, py) in &c[1..] {
+            svg.push_str(&format!("L{:.1},{:.1}", px * sxx, py * syy));
+        }
+        svg.push_str("\"/>");
     }
     svg.push_str("</g></svg>");
 
@@ -535,7 +579,15 @@ fn gauss_blur(gray: &GrayImage, sigma: f32) -> GrayImage {
 
 /// Extended Difference-of-Gaussians: dark stylized lines on white.
 /// `strength` 0..=1 maps to the epsilon threshold (lower eps = more lines).
-fn xdog_lines(lum: &[f32], w: u32, h: u32, strength: f32) -> Vec<u8> {
+/// XDoG output: full-res binary for previews plus vector chains in small-px.
+struct XdogOut {
+    full: Vec<u8>,
+    chains: Vec<Vec<(f32, f32)>>,
+    sw: u32,
+    sh: u32,
+}
+
+fn xdog_lines(lum: &[f32], w: u32, h: u32, strength: f32) -> XdogOut {
     let (wu, hu) = (w as usize, h as usize);
     // Compute the response at reduced resolution (edges survive downscaling)
     // with hand-rolled sampling: the generic ops resize is ~1s at 2MP.
@@ -584,44 +636,348 @@ fn xdog_lines(lum: &[f32], w: u32, h: u32, strength: f32) -> Vec<u8> {
     let min_size = (30.0 - 20.0 * strength.clamp(0.0, 1.0)) as usize;
     let mut kept = hysteresis(&small_out, swu, shu, high, low);
     sweep_small(&mut kept, swu, shu, min_size);
+    // Close before thinning: joins dotted seams and 1-2px gaps into continuous
+    // strokes (the old filled-blob pass got this from close_u8 r1). Without
+    // it the skeleton shatters into swept-away fragments.
+    let kept = erode(&dilate(&kept, sw, sh, 1), sw, sh, 1);
     let mut bin = vec![255u8; swu * shu];
     for (i, &k) in kept.iter().enumerate() {
         if k {
             bin[i] = 0;
         }
     }
-    if sw == w && sh == h {
-        return close_u8(&bin_thinned(bin, sw, sh), w, h);
+    let mut skel = zhang_suen(&bin, swu, shu);
+    // Minimal pre-filtering: kill only pixel dots here. Dotted seams must
+    // reach the graph-level merge intact (it joins by chord fit); size
+    // filtering happens on final arc length instead.
+    sweep_small(&mut skel, swu, shu, 4);
+    // Spur pruning: delete 1-2px nubs that only add junction splits.
+    prune_spurs(&mut skel, swu, shu, 3);
+    let mut chains = trace_chains(&skel, swu, shu);
+    // Rejoin dotted-seam fragments split at junctions / small gaps.
+    merge_collinear(&mut chains, 4.0);
+    let chains = chains
+        .into_iter()
+        .filter(|c| c.len() >= 2)
+        .map(|c| simplify_dp(&c, 1.0))
+        .filter(|c| arc_len(c) >= 3.0)
+        .collect::<Vec<_>>();
+    // Full-res binary for the sidebar preview + debug dumps.
+    let full = {
+        let mut b = vec![255u8; swu * shu];
+        for (i, &k) in skel.iter().enumerate() {
+            if k {
+                b[i] = 0;
+            }
+        }
+        if sw == w && sh == h {
+            b
+        } else {
+            upscale_nearest_u8(&b, sw, sh, w, h)
+        }
+    };
+    XdogOut {
+        full,
+        chains,
+        sw,
+        sh,
     }
-    let up = upscale_nearest_u8(&bin_thinned(bin, sw, sh), sw, sh, w, h);
-    close_u8(&up, w, h)
 }
 
-/// Morphological close (dilate then erode, r=1) on a 0/255 buffer.
-/// Bridges single-pixel corner gaps in upscaled staircase diagonals so the
-/// tracer sees connected strokes instead of dotted fragments.
-fn close_u8(g: &[u8], w: u32, h: u32) -> Vec<u8> {
-    let b: Vec<bool> = g.iter().map(|&v| v < 128).collect();
-    let closed = erode(&dilate(&b, w, h, 1), w, h, 1);
-    closed
-        .iter()
-        .map(|&v| if v { 0u8 } else { 255u8 })
-        .collect()
-}
-
-/// Thin a small binary buffer to its 1px centerline skeleton so traced
-/// details render as uniform pen strokes instead of variable-width blobs.
-fn bin_thinned(bin: Vec<u8>, sw: u32, sh: u32) -> Vec<u8> {
-    let mut skel = zhang_suen(&bin, sw as usize, sh as usize);
-    // Post-thin sweep: drop dot fragments the skeleton left behind.
-    sweep_small(&mut skel, sw as usize, sh as usize, 10);
-    let mut thin = vec![255u8; skel.len()];
-    for (i, &k) in skel.iter().enumerate() {
-        if k {
-            thin[i] = 0;
+/// Spur pruning: delete short branches rooted at a junction (staircase
+/// artifacts on diagonals, ragged-edge twigs). Isolated dashes have an
+/// endpoint at both ends, so they survive. Repeat passes; each removal can
+/// reveal a new short spur. The junction root pixel itself is kept.
+fn prune_spurs(skel: &mut [bool], w: usize, h: usize, max_len: usize) {
+    const DX8: [i32; 8] = [1, 1, 0, -1, -1, -1, 0, 1];
+    const DY8: [i32; 8] = [0, 1, 1, 1, 0, -1, -1, -1];
+    let at = |x: i32, y: i32, s: &[bool]| -> bool {
+        x >= 0 && y >= 0 && (x as usize) < w && (y as usize) < h && s[y as usize * w + x as usize]
+    };
+    let ncount = |x: i32, y: i32, s: &[bool]| -> usize {
+        (0..8).filter(|&k| at(x + DX8[k], y + DY8[k], s)).count()
+    };
+    for _ in 0..3 {
+        let mut changed = false;
+        for y in 0..h {
+            for x in 0..w {
+                if !skel[y * w + x] || ncount(x as i32, y as i32, skel) != 1 {
+                    continue;
+                }
+                let mut branch = vec![(x as i32, y as i32)];
+                let (mut cx, mut cy) = (x as i32, y as i32);
+                let (mut px, mut py) = (-1, -1);
+                // Incoming step direction; prefer the straightest neighbor so
+                // the walk doesn't shortcut diagonally onto crossing lines.
+                let (mut dx, mut dy) = (0i32, 0i32);
+                loop {
+                    let mut nxt: Option<(i32, i32)> = None;
+                    let mut best_dot = i32::MIN;
+                    for k in 0..8 {
+                        let (nx, ny) = (cx + DX8[k], cy + DY8[k]);
+                        if (nx != px || ny != py) && at(nx, ny, skel) {
+                            let dot = DX8[k] * dx + DY8[k] * dy;
+                            if nxt.is_none() || dot > best_dot {
+                                best_dot = dot;
+                                nxt = Some((nx, ny));
+                            }
+                        }
+                    }
+                    match nxt {
+                        None => break,
+                        Some((nx, ny)) => {
+                            (dx, dy) = (nx - cx, ny - cy);
+                            (px, py) = (cx, cy);
+                            (cx, cy) = (nx, ny);
+                            branch.push((cx, cy));
+                            if ncount(cx, cy, skel) != 2 {
+                                break;
+                            }
+                        }
+                    }
+                }
+                // Twig = short branch ending at a junction. Pop the root so
+                // the junction (shared with other branches) survives.
+                if branch.len() <= max_len + 1 && ncount(cx, cy, skel) >= 3 {
+                    branch.pop();
+                    for &(bx, by) in &branch {
+                        skel[by as usize * w + bx as usize] = false;
+                    }
+                    changed = true;
+                }
+            }
+        }
+        if !changed {
+            break;
         }
     }
-    thin
+}
+
+/// Walk the skeleton into polyline chains (small-px float coords).
+/// Splits at junctions (round caps rejoin them visually); loops close.
+fn trace_chains(skel: &[bool], w: usize, h: usize) -> Vec<Vec<(f32, f32)>> {
+    const DX8: [i32; 8] = [1, 1, 0, -1, -1, -1, 0, 1];
+    const DY8: [i32; 8] = [0, 1, 1, 1, 0, -1, -1, -1];
+    let at = |x: i32, y: i32| -> bool {
+        x >= 0
+            && y >= 0
+            && (x as usize) < w
+            && (y as usize) < h
+            && skel[y as usize * w + x as usize]
+    };
+    let ncount =
+        |x: i32, y: i32| -> usize { (0..8).filter(|&k| at(x + DX8[k], y + DY8[k])).count() };
+    // Walk from (sx,sy) through unvisited pixels. Junctions/endpoints stop
+    // the walk (already pushed); the start pixel always takes one step.
+    let walk = |sx: i32, sy: i32, visited: &mut [bool]| -> Vec<(f32, f32)> {
+        let mut path = vec![(sx as f32, sy as f32)];
+        let (mut cx, mut cy) = (sx, sy);
+        loop {
+            if ncount(cx, cy) != 2 && (cx != sx || cy != sy) {
+                break;
+            }
+            let mut nxt = None;
+            for k in 0..8 {
+                let (nx, ny) = (cx + DX8[k], cy + DY8[k]);
+                if at(nx, ny) && !visited[ny as usize * w + nx as usize] {
+                    nxt = Some((nx, ny));
+                    break;
+                }
+            }
+            let (nx, ny) = match nxt {
+                Some(p) => p,
+                None => break,
+            };
+            path.push((nx as f32, ny as f32));
+            visited[ny as usize * w + nx as usize] = true;
+            (cx, cy) = (nx, ny);
+        }
+        path
+    };
+    let mut visited = vec![false; w * h];
+    let mut chains: Vec<Vec<(f32, f32)>> = Vec::new();
+    // 1. endpoint walks.
+    for y in 0..h {
+        for x in 0..w {
+            let i = y * w + x;
+            if skel[i] && !visited[i] && ncount(x as i32, y as i32) == 1 {
+                visited[i] = true;
+                chains.push(walk(x as i32, y as i32, &mut visited));
+            }
+        }
+    }
+    // 2. junction fans: one chain per unvisited direction, rooted at J.
+    for y in 0..h {
+        for x in 0..w {
+            let i = y * w + x;
+            if !skel[i] || visited[i] || ncount(x as i32, y as i32) < 3 {
+                continue;
+            }
+            visited[i] = true;
+            for k in 0..8 {
+                let (nx, ny) = (x as i32 + DX8[k], y as i32 + DY8[k]);
+                if at(nx, ny) && !visited[ny as usize * w + nx as usize] {
+                    // Mark the walk start (walk() only marks stepped pixels).
+                    visited[ny as usize * w + nx as usize] = true;
+                    let mut c = vec![(x as f32, y as f32)];
+                    c.extend(walk(nx, ny, &mut visited));
+                    chains.push(c);
+                }
+            }
+        }
+    }
+    // 3. leftover loops: walk until closed.
+    for y in 0..h {
+        for x in 0..w {
+            let i = y * w + x;
+            if skel[i] && !visited[i] {
+                visited[i] = true;
+                let mut c = walk(x as i32, y as i32, &mut visited);
+                if c.len() > 2 {
+                    let (fx, fy) = c[0];
+                    let (lx, ly) = c[c.len() - 1];
+                    if (fx - lx).abs() <= 1.5 && (fy - ly).abs() <= 1.5 {
+                        c.push((fx, fy));
+                    }
+                }
+                chains.push(c);
+            }
+        }
+    }
+    // Dots (isolated pixels) carry no linework; drop them at the source.
+    chains.into_iter().filter(|c| c.len() >= 2).collect()
+}
+
+/// Greedily merge chain ends that nearly touch and continue (near-)straight:
+/// thinning splits lines at every junction pixel, and staircase diagonals
+/// shatter into short fragments that turn sharply, so tangent alignment is
+/// the wrong test. Instead join the pair whose concatenation best fits its
+/// end-to-end chord (staircase fits a line; a collar V does not). Sharp
+/// corners stay split and rejoin visually via round caps.
+fn merge_collinear(chains: &mut Vec<Vec<(f32, f32)>>, gap: f32) {
+    /// Max perpendicular deviation of points from the end-to-end chord.
+    fn chord_dev(pts: &[(f32, f32)]) -> f32 {
+        if pts.len() <= 2 {
+            return 0.0;
+        }
+        let (ax, ay) = pts[0];
+        let (bx, by) = pts[pts.len() - 1];
+        let (dx, dy) = (bx - ax, by - ay);
+        let den = (dx * dx + dy * dy).sqrt().max(1e-6);
+        pts.iter()
+            .map(|&(px, py)| (dy * px - dx * py + bx * ay - by * ax).abs() / den)
+            .fold(0.0, f32::max)
+    }
+    const FIT_TOL: f32 = 1.0;
+    loop {
+        // (i, ie, j, je, dev), minimizing dev among ends within gap.
+        let mut best: Option<(usize, bool, usize, bool, f32)> = None;
+        for i in 0..chains.len() {
+            if chains[i].len() < 2 {
+                continue;
+            }
+            for j in (i + 1)..chains.len() {
+                if chains[j].len() < 2 {
+                    continue;
+                }
+                for &ie in &[false, true] {
+                    for &je in &[false, true] {
+                        let pi = if ie {
+                            *chains[i].last().unwrap()
+                        } else {
+                            chains[i][0]
+                        };
+                        let pj = if je {
+                            *chains[j].last().unwrap()
+                        } else {
+                            chains[j][0]
+                        };
+                        let dist = ((pi.0 - pj.0).powi(2) + (pi.1 - pj.1).powi(2)).sqrt();
+                        if dist > gap {
+                            continue;
+                        }
+                        // Orient i so the join is its tail, j so the join is
+                        // its head, then test the chord fit.
+                        let mut cand: Vec<(f32, f32)> = if ie {
+                            chains[i].clone()
+                        } else {
+                            chains[i].iter().rev().cloned().collect()
+                        };
+                        let other: Vec<(f32, f32)> = if je {
+                            chains[j].iter().rev().cloned().collect()
+                        } else {
+                            chains[j].clone()
+                        };
+                        let skip = usize::from(dist < 0.75);
+                        cand.extend(other.into_iter().skip(skip));
+                        let dev = chord_dev(&cand);
+                        if dev <= FIT_TOL && best.map(|b| dev < b.4).unwrap_or(true) {
+                            best = Some((i, ie, j, je, dev));
+                        }
+                    }
+                }
+            }
+        }
+        let (i, ie, j, je, _) = match best {
+            Some(b) => b,
+            None => break,
+        };
+        // Rebuild: orient i so the join is its tail, j so the join is its
+        // head, then concatenate (skipping a duplicated junction pixel).
+        if !ie {
+            chains[i].reverse();
+        }
+        if je {
+            chains[j].reverse();
+        }
+        let mut merged = std::mem::take(&mut chains[i]);
+        let other = std::mem::take(&mut chains[j]);
+        let (lx, ly) = *merged.last().unwrap();
+        let skip = ((other[0].0 - lx).powi(2) + (other[0].1 - ly).powi(2)).sqrt() < 0.75;
+        merged.extend(other.into_iter().skip(usize::from(skip)));
+        chains[i] = merged;
+        chains.remove(j);
+    }
+    chains.retain(|c| c.len() >= 2);
+}
+
+/// Polyline arc length in chain (small-px) units.
+fn arc_len(c: &[(f32, f32)]) -> f32 {
+    c.windows(2)
+        .map(|w| ((w[1].0 - w[0].0).powi(2) + (w[1].1 - w[0].1).powi(2)).sqrt())
+        .sum()
+}
+
+/// Douglas-Peucker simplification (recursive; chains are short).
+fn simplify_dp(pts: &[(f32, f32)], tol: f32) -> Vec<(f32, f32)> {
+    if pts.len() <= 2 {
+        return pts.to_vec();
+    }
+    let (ax, ay) = pts[0];
+    let (bx, by) = pts[pts.len() - 1];
+    let (dx, dy) = (bx - ax, by - ay);
+    let den = (dx * dx + dy * dy).sqrt();
+    let mut max_d = 0.0f32;
+    let mut idx = 0;
+    for (i, &(px, py)) in pts.iter().enumerate().skip(1).take(pts.len() - 2) {
+        let d = if den == 0.0 {
+            ((px - ax).powi(2) + (py - ay).powi(2)).sqrt()
+        } else {
+            (dy * px - dx * py + bx * ay - by * ax).abs() / den
+        };
+        if d > max_d {
+            max_d = d;
+            idx = i;
+        }
+    }
+    if max_d <= tol {
+        return vec![pts[0], pts[pts.len() - 1]];
+    }
+    let mut left = simplify_dp(&pts[..=idx], tol);
+    let right = simplify_dp(&pts[idx..], tol);
+    left.pop();
+    left.extend(right);
+    left
 }
 
 /// Zhang-Suen thinning: reduce foreground (<128) to a 1px 8-connected
@@ -809,18 +1165,6 @@ fn mask_to_color(mask: &[bool], w: u32, h: u32) -> ColorImage {
     }
 }
 
-fn gray_to_color(g: &[u8], w: u32, h: u32) -> ColorImage {
-    let mut pixels = Vec::with_capacity((w * h * 4) as usize);
-    for &v in g {
-        pixels.extend_from_slice(&[v, v, v, 255]);
-    }
-    ColorImage {
-        pixels,
-        width: w as usize,
-        height: h as usize,
-    }
-}
-
 /// Downscaled PNG for the UI sidebar (None if encoding fails).
 fn png_thumb_gray(g: &[u8], w: u32, h: u32) -> Option<Vec<u8>> {
     let full = GrayImage::from_raw(w, h, g.to_vec())?;
@@ -982,12 +1326,116 @@ mod tests {
         assert!(out.svg.contains("id=\"details\""), "has details group");
         assert!(out.svg.contains("stroke-width"), "silhouette is stroked");
         assert!(
+            out.svg.contains("fill=\"none\""),
+            "details are stroked polylines"
+        );
+        assert!(!out.svg.contains("stroke-dasharray"), "solid by default");
+        // Dashed mode emits the stitch convention.
+        let out_d = convert_flat_bytes(
+            &png,
+            &FlatOptions {
+                stitch_dashed: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert!(
+            out_d.svg.contains("stroke-dasharray=\"7 4\""),
+            "dashed stitches"
+        );
+        assert!(
             out.path_count >= 2,
             "silhouette + at least one detail, got {}",
             out.path_count
         );
         // No vtracer xml preamble leaks into the composed file.
         assert!(!out.svg.contains("Generator"), "no nested vtracer header");
+    }
+
+    #[test]
+    fn chains_split_at_junctions() {
+        // T shape (9x9): vertical x4 rows 1..8 + arms (2..7,4).
+        // Junction at (4,4) fans into separate chains.
+        let mut m = vec![false; 81];
+        for y in 1..8 {
+            m[y * 9 + 4] = true;
+        }
+        for x in 2..7 {
+            m[4 * 9 + x] = true;
+        }
+        let chains = trace_chains(&m, 9, 9);
+        assert!(chains.len() >= 3, "junction fans out, got {}", chains.len());
+        for c in &chains {
+            assert!(c.len() >= 2, "no dot chains");
+        }
+    }
+
+    #[test]
+    fn dp_collapses_straight_runs() {
+        let line: Vec<(f32, f32)> = (0..20).map(|x| (x as f32, 3.0)).collect();
+        let s = simplify_dp(&line, 1.0);
+        assert_eq!(s.len(), 2, "straight -> endpoints, got {s:?}");
+        assert_eq!(s[0], (0.0, 3.0));
+        assert_eq!(s[1], (19.0, 3.0));
+    }
+
+    #[test]
+    fn spurs_pruned_dash_kept() {
+        // 20px line with a 2px twig at x10 + an isolated 5px dash.
+        // The twig tip is removed (its 1px base nub may remain; the tracer's
+        // arc-length filter drops such nubs and merges across them).
+        let (w, h) = (30usize, 12usize);
+        let mut m = vec![false; w * h];
+        for x in 2..22 {
+            m[5 * w + x] = true;
+        }
+        m[6 * w + 10] = true;
+        m[7 * w + 10] = true;
+        for x in 24..29 {
+            m[8 * w + x] = true;
+        }
+        prune_spurs(&mut m, w, h, 5);
+        assert!(!m[7 * w + 10], "twig tip removed");
+        assert!(m[5 * w + 10], "junction root survives");
+        assert!(m[5 * w + 3] && m[5 * w + 21], "main line intact");
+        assert!(m[8 * w + 26], "isolated dash kept");
+    }
+
+    #[test]
+    fn staircase_merges_v_corner_does_not() {
+        // Staircase fragments turn 90 deg but still fit one chord (dev 0.89).
+        let mut chains = vec![
+            vec![(0.0, 0.0), (1.0, 0.0), (2.0, 0.0)],
+            vec![(2.0, 0.0), (2.0, 1.0), (2.0, 2.0), (3.0, 2.0), (4.0, 2.0)],
+        ];
+        merge_collinear(&mut chains, 3.0);
+        assert_eq!(chains.len(), 1, "staircase merges, got {}", chains.len());
+        // V corner (dev 3.5) must stay split for a sharp collar point.
+        let mut corner = vec![
+            vec![(0.0, 0.0), (5.0, 0.0), (10.0, 0.0)],
+            vec![(11.0, 1.0), (16.0, 6.0)],
+        ];
+        merge_collinear(&mut corner, 3.0);
+        assert_eq!(
+            corner.len(),
+            2,
+            "V corner stays split, got {}",
+            corner.len()
+        );
+    }
+
+    #[test]
+    fn collinear_ends_merge_corners_dont() {
+        let mut chains = vec![
+            vec![(0.0, 0.0), (5.0, 0.0), (10.0, 0.0)],
+            vec![(11.0, 0.0), (16.0, 0.0), (21.0, 0.0)],
+            vec![(10.0, 1.0), (10.0, 6.0)],
+        ];
+        merge_collinear(&mut chains, 4.0);
+        assert_eq!(chains.len(), 2, "one merge, got {}", chains.len());
+        let long = chains.iter().find(|c| c.len() == 6).expect("merged chain");
+        assert_eq!(long[0], (0.0, 0.0));
+        assert_eq!(long[5], (21.0, 0.0));
     }
 
     #[test]
