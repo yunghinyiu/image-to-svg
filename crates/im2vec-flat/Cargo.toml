@@ -7,4 +7,3 @@ edition = "2021"
 im2vec-core = { path = "../im2vec-core" }
 image = "0.25"
 anyhow = "1"
-serde = { version = "1", features = ["derive"] }

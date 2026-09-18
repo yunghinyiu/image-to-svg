@@ -6,6 +6,7 @@ use axum::{
     Json, Router,
 };
 use im2vec_core::{convert_bytes, ConvertOptions, ImPreset};
+use im2vec_flat::{FlatInput, FlatOptions};
 use serde::Serialize;
 use std::time::Instant;
 
@@ -39,6 +40,8 @@ fn parse_preset(s: &str) -> ImPreset {
 async fn api_convert(mut mp: Multipart) -> Result<Json<ConvertResponse>, (StatusCode, String)> {
     let mut file_bytes: Option<Vec<u8>> = None;
     let mut opts = ConvertOptions::default();
+    let mut preset_raw = String::from("logo");
+    let mut flat_input = String::from("flatlay");
 
     while let Some(field) = mp
         .next_field()
@@ -53,7 +56,11 @@ async fn api_convert(mut mp: Multipart) -> Result<Json<ConvertResponse>, (Status
         let text = String::from_utf8_lossy(&data).to_string();
         match name.as_str() {
             "file" => file_bytes = Some(data.to_vec()),
-            "preset" => opts = ConvertOptions::for_preset(parse_preset(text.trim())),
+            "preset" => {
+                preset_raw = text.trim().to_string();
+                opts = ConvertOptions::for_preset(parse_preset(&preset_raw));
+            }
+            "flat_input" => flat_input = text.trim().to_string(),
             "mode" => opts.mode = text.trim().to_string(),
             "hierarchical" => opts.hierarchical = text.trim().to_string(),
             "filter_speckle" => {
@@ -111,6 +118,32 @@ async fn api_convert(mut mp: Multipart) -> Result<Json<ConvertResponse>, (Status
     }
 
     let t = Instant::now();
+    if preset_raw == "flat" {
+        let speckle = opts.filter_speckle;
+        let out = tokio::task::spawn_blocking(move || {
+            im2vec_flat::convert_flat_bytes(
+                &bytes,
+                &FlatOptions {
+                    input: FlatInput::parse(&flat_input),
+                    symmetrize: true,
+                    outline_width: 2.0,
+                    detail_strength: 0.6,
+                    speckle,
+                },
+            )
+        })
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("task: {e}")))?
+        .map_err(|e| (StatusCode::UNPROCESSABLE_ENTITY, format!("flat: {e:#}")))?;
+        return Ok(Json(ConvertResponse {
+            svg: out.svg,
+            width: out.width,
+            height: out.height,
+            path_count: out.path_count,
+            svg_bytes: out.svg_bytes,
+            elapsed_ms: t.elapsed().as_millis(),
+        }));
+    }
     let out = tokio::task::spawn_blocking(move || convert_bytes(&bytes, &opts))
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("task: {e}")))?
@@ -187,7 +220,11 @@ const INDEX_HTML: &str = r#"<!doctype html>
       <option value="illustration">illustration — more colors</option>
       <option value="photo">photo — keeps gradients/shadows</option>
       <option value="mono">mono — black &amp; white line art</option>
+      <option value="flat">flat — clothing photo → tech-pack sketch</option>
     </select>
+    <div class="row">
+      <div><label>Photo type (flat preset)</label><select id="flat_input"><option value="flatlay" selected>flat-lay / ghost mannequin</option><option value="on-model" disabled>on-model — Phase 2</option></select></div>
+    </div>
     <div class="row">
       <div><label>Mode</label><select id="mode"><option value="spline" selected>spline</option><option value="polygon">polygon</option><option value="pixel">pixel</option></select></div>
       <div><label>Layers</label><select id="hierarchical"><option value="stacked" selected>stacked</option><option value="cutout">cutout (seam-free)</option></select></div>
@@ -273,6 +310,7 @@ async function convert() {
   const fd = new FormData();
   fd.append('file', f, currentName || 'image.png');
   fd.append('preset', $('preset').value);
+  fd.append('flat_input', $('flat_input').value);
   fd.append('mode', $('mode').value);
   fd.append('hierarchical', $('hierarchical').value);
   fd.append('filter_speckle', $('filter_speckle').value);

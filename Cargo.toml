@@ -4,7 +4,6 @@ members = [
     "crates/im2vec-cli",
     "crates/im2vec-web",
     "crates/im2vec-flat",
-    "crates/im2vec-eval",
 ]
 resolver = "2"
 
