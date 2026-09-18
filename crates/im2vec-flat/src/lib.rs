@@ -1632,13 +1632,16 @@ fn chain_bbox_centroid(c: &[(f32, f32)]) -> ((f32, f32, f32, f32), (f32, f32)) {
 }
 
 /// Classify a chain in output-pixel coords (after sxx/syy scaling).
-/// Thresholds from blazer chain stats: 173/203 paths < 100px (texture),
-/// ~30 long/straight (seams).
 /// `edge_band`: mask of pixels within STITCH_EDGE_DIST of the silhouette
 /// boundary (precomputed).
 /// `rgb`: source image for brightness check (white stitching vs blue denim).
-/// Short bright chains near edges or linear are photo topstitching (Stitch);
-/// short dark/medium chains are texture (Noise).
+///
+/// v2 thresholds distilled from the Jev prototype experiment (2026-09-18):
+/// Jev promoted 56/117 heuristic "folds" to seam/stitch with 64% ground-truth
+/// confirmation, revealing two systematic blind spots in the v1 cutoffs:
+/// straight dark chains just under the 90px seam cutoff (near-miss seams),
+/// and medium-length bright chains hugging the silhouette edge (topstitching
+/// rows the old len<25 gate excluded).
 fn classify_chain(
     c: &[(f32, f32)],
     edge_band: &[bool],
@@ -1647,21 +1650,29 @@ fn classify_chain(
     h: usize,
 ) -> ChainKind {
     let len = arc_len(c);
-    if len > 90.0 && straightness(c) > 0.85 {
+    let straight = straightness(c);
+    let (_, bright_frac) = chain_brightness(c, rgb, w, h);
+    let edge_frac = chain_edge_frac(c, edge_band, w, h);
+    // Seam: long + straight structural lines, or medium + very straight +
+    // dark near-miss seams (front edges, plackets).
+    if (len > 90.0 && straight > 0.85) || (len > 45.0 && straight > 0.95 && bright_frac < 0.35) {
         return ChainKind::Seam;
     }
     if len < 25.0 {
         // Sample brightness: white stitching (L>130) vs blue denim (L~110-120).
         // Note: chains sit on stitch edges, so sample is mixed; threshold low.
-        let (_, bright_frac) = chain_brightness(c, rgb, w, h);
         let is_bright = bright_frac >= 0.5;
         // Near-edge short chains = photo topstitching (hem/cuff/front edge).
-        let near_edge = chain_edge_frac(c, edge_band, w, h) >= 0.5;
+        let near_edge = edge_frac >= 0.5;
         // Bright + (near edge OR linear) = stitching; else texture.
-        if is_bright && (near_edge || straightness(c) > 0.7) {
+        if is_bright && (near_edge || straight > 0.7) {
             return ChainKind::Stitch;
         }
         return ChainKind::Noise;
+    }
+    // Medium-length bright chains hugging the silhouette edge are topstitching.
+    if bright_frac >= 0.4 && edge_frac >= 0.6 {
+        return ChainKind::Stitch;
     }
     ChainKind::Fold
 }
