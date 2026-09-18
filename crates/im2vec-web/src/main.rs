@@ -6,9 +6,14 @@ use axum::{
     Json, Router,
 };
 use im2vec_core::{convert_bytes, ConvertOptions, ImPreset};
+use im2vec_eval::{run_eval, EvalReport};
 use im2vec_flat::{FlatInput, FlatOptions};
 use serde::Serialize;
 use std::time::Instant;
+
+/// Blazer 1:1 eval pair, embedded so /eval works from any working directory.
+const BLAZER_INPUT: &[u8] = include_bytes!("../../../samples/blazer/input.png");
+const BLAZER_TARGET: &[u8] = include_bytes!("../../../samples/blazer/target.png");
 
 #[derive(Serialize)]
 struct StageView {
@@ -41,8 +46,69 @@ async fn index() -> Html<&'static str> {
     Html(INDEX_HTML)
 }
 
+async fn eval_page() -> Html<&'static str> {
+    Html(EVAL_HTML)
+}
+
 async fn healthz() -> &'static str {
     "ok"
+}
+
+#[derive(Clone, Serialize)]
+struct EvalBlazerResponse {
+    input: String,
+    target: String,
+    onion: String,
+    svg: String,
+    svg_width: u32,
+    svg_height: u32,
+    target_width: u32,
+    target_height: u32,
+    ours_bbox_norm: [f32; 4],
+    target_bbox_norm: [f32; 4],
+    metrics: EvalReport,
+    elapsed_ms: u128,
+}
+
+fn png_data_url(bytes: &[u8]) -> String {
+    use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
+    format!("data:image/png;base64,{}", B64.encode(bytes))
+}
+
+/// The blazer eval is expensive (~1 min: full flat pipeline + metrics), so
+/// compute it once per server run and serve the cached result.
+static BLAZER_EVAL: std::sync::OnceLock<Result<EvalBlazerResponse, String>> =
+    std::sync::OnceLock::new();
+
+fn compute_blazer_eval() -> Result<EvalBlazerResponse, String> {
+    let t = Instant::now();
+    let art = run_eval(BLAZER_INPUT, BLAZER_TARGET, &FlatOptions::default())
+        .map_err(|e| format!("{e:#}"))?;
+    let r = &art.report;
+    Ok(EvalBlazerResponse {
+        input: png_data_url(BLAZER_INPUT),
+        target: png_data_url(BLAZER_TARGET),
+        onion: png_data_url(&art.onion_png),
+        svg: art.svg,
+        svg_width: r.svg_size[0],
+        svg_height: r.svg_size[1],
+        target_width: r.eval_canvas_target[0],
+        target_height: r.eval_canvas_target[1],
+        ours_bbox_norm: r.ours_bbox_norm,
+        target_bbox_norm: r.target_bbox_norm,
+        metrics: r.clone(),
+        elapsed_ms: t.elapsed().as_millis(),
+    })
+}
+
+async fn api_eval_blazer() -> Result<Json<EvalBlazerResponse>, (StatusCode, String)> {
+    let cached =
+        tokio::task::spawn_blocking(|| BLAZER_EVAL.get_or_init(compute_blazer_eval).clone())
+            .await
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("task: {e}")))?;
+    cached
+        .map(Json)
+        .map_err(|e| (StatusCode::UNPROCESSABLE_ENTITY, e))
 }
 
 fn parse_preset(s: &str) -> ImPreset {
@@ -215,8 +281,10 @@ async fn api_convert(mut mp: Multipart) -> Result<Json<ConvertResponse>, (Status
 async fn main() {
     let app = Router::new()
         .route("/", get(index))
+        .route("/eval", get(eval_page))
         .route("/healthz", get(healthz))
         .route("/api/convert", post(api_convert))
+        .route("/api/eval/blazer", get(api_eval_blazer))
         .layer(DefaultBodyLimit::max(30 * 1024 * 1024));
 
     let port: u16 = std::env::var("PORT")
@@ -228,6 +296,137 @@ async fn main() {
     let listener = tokio::net::TcpListener::bind(&addr).await.unwrap();
     axum::serve(listener, app).await.unwrap();
 }
+
+const EVAL_HTML: &str = r#"<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1"/>
+<title>im2vec — 1:1 eval (blazer tech pack)</title>
+<style>
+  :root { color-scheme: light dark; }
+  body { font-family: ui-sans-serif, system-ui, sans-serif; margin: 0; background: #0f1115; color: #e8eaf0; }
+  header { padding: 20px 24px; border-bottom: 1px solid #262b36; }
+  header h1 { margin: 0; font-size: 20px; } header p { margin: 4px 0 0; color: #9aa3b2; font-size: 13px;}
+  header a { color: #8fb4ff; }
+  main { padding: 16px 24px; max-width: 1500px; margin: 0 auto; }
+  .panel { background: #171b22; border: 1px solid #262b36; border-radius: 12px; padding: 16px; margin-bottom: 16px; }
+  .panel h2 { margin: 0 0 12px; font-size: 15px; }
+  .grid3 { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 16px; }
+  .grid2 { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
+  .view { min-height: 300px; display: flex; align-items: center; justify-content: center; background: #fff; border-radius: 8px; overflow: auto; padding: 8px; }
+  .view img, .view svg { max-width: 100%; max-height: 52vh; }
+  .cap { font-size: 12px; color: #9aa3b2; margin: 8px 0 0; }
+  table.metrics { border-collapse: collapse; font-size: 13px; width: 100%; }
+  table.metrics td, table.metrics th { border-bottom: 1px solid #262b36; padding: 7px 10px; text-align: left; }
+  table.metrics th { color: #9aa3b2; font-weight: 600; width: 260px; }
+  table.metrics td.v { font-variant-numeric: tabular-nums; }
+  .good { color: #7ee2a8; } .bad { color: #ff9a9a; } .mid { color: #ffd479; }
+  #onionwrap { position: relative; background: #fff; border-radius: 8px; overflow: hidden; }
+  #onionwrap img#otarget { display: block; width: 100%; }
+  #overlay { position: absolute; }
+  #overlay svg { width: 100% !important; height: 100% !important; display: block; }
+  .controls { display: flex; align-items: center; gap: 12px; margin-top: 10px; font-size: 13px; color: #9aa3b2; }
+  .controls input[type=range] { flex: 1; }
+  #status { color: #ffd479; }
+  @media (max-width: 1100px){ .grid3{grid-template-columns:1fr;} .grid2{grid-template-columns:1fr;} }
+</style>
+</head>
+<body>
+<header><h1>1:1 eval — blazer tech pack</h1><p><a href="/">← converter</a> &nbsp; Our flat-pipeline SVG vs. the reference technical flat. Metrics align our output to the reference (uniform scale + translation on garment bboxes) before comparing. <span id="status">computing… (first load runs the full pipeline, ~1 min)</span></p></header>
+<main>
+  <div class="panel"><h2>Metrics</h2><table class="metrics" id="metrics"><tr><td>loading…</td></tr></table></div>
+  <div class="panel"><h2>Side by side</h2>
+    <div class="grid3">
+      <div><div class="view" id="vinput"></div><p class="cap">input photo</p></div>
+      <div><div class="view" id="vours"></div><p class="cap">our SVG (flat preset, default)</p></div>
+      <div><div class="view" id="vtarget"></div><p class="cap">reference technical flat</p></div>
+    </div>
+  </div>
+  <div class="panel"><h2>Onion-skin overlay (interactive)</h2>
+    <div id="onionwrap"><img id="otarget" alt="reference"/><div id="overlay"></div></div>
+    <div class="controls">
+      <label><input type="checkbox" id="showours" checked/> show our SVG</label>
+      <span>opacity</span><input type="range" id="op" min="0" max="100" value="55"/>
+      <span id="opv">55%</span>
+    </div>
+    <p class="cap">Our SVG is aligned to the reference via the garment-bbox similarity transform (same as the metrics). Drag the slider to cross-fade.</p>
+  </div>
+  <div class="grid2">
+    <div class="panel"><h2>Server onion-skin (reference black, ours red)</h2><div class="view" id="vonion"></div>
+    <p class="cap">Black = reference ink. Red = our ink where the reference has none. White = neither.</p></div>
+    <div class="panel"><h2>How to re-run</h2>
+      <p class="cap" style="font-size:13px">Quantitative metrics + diff PNGs (measurement only, no pipeline changes):</p>
+      <pre style="font-size:12px;background:#0f1319;padding:10px;border-radius:8px;overflow:auto">cargo run -p im2vec-eval -- \
+  --input samples/blazer/input.png \
+  --target samples/blazer/target.png \
+  --out-dir docs/eval --name baseline</pre>
+      <p class="cap" style="font-size:13px">Full 1:1 definition and human-rated checklist: <b>docs/eval/1-1-checklist.md</b></p>
+    </div>
+  </div>
+</main>
+<script>
+const $ = id => document.getElementById(id);
+function row(name, val, cls){ return `<tr><th>${name}</th><td class="v ${cls||''}">${val}</td></tr>`; }
+function fmt(x, d){ return (x === null || x === undefined || !isFinite(x)) ? '—' : Number(x).toFixed(d); }
+async function load(){
+  let j;
+  try {
+    j = await (await fetch('/api/eval/blazer')).json();
+  } catch(e){ $('status').textContent = 'error: ' + e.message; return; }
+  if (!j.metrics) { $('status').textContent = 'error computing eval'; return; }
+  const m = j.metrics;
+  $('status').textContent = `done in ${(j.elapsed_ms/1000).toFixed(0)}s (cached on later loads)`;
+  $('status').style.color = '#7ee2a8';
+  const iouCls = m.silhouette_iou >= 0.97 ? 'good' : (m.silhouette_iou >= 0.9 ? 'mid' : 'bad');
+  const chCls = m.chamfer_px <= 3 ? 'good' : (m.chamfer_px <= 8 ? 'mid' : 'bad');
+  const inkCls = (m.ink_ratio_ours_to_target >= 0.8 && m.ink_ratio_ours_to_target <= 1.2) ? 'good' : 'mid';
+  const btnCls = (m.buttons_matched === 18) ? 'good' : (m.buttons_matched >= 12 ? 'mid' : 'bad');
+  $('metrics').innerHTML =
+    row('silhouette IoU (target ≥ 0.97)', fmt(m.silhouette_iou, 3), iouCls) +
+    row('chamfer symmetric (target ≤ 3px @1024)', fmt(m.chamfer_px, 1) + ' px', chCls) +
+    row('chamfer ours → target (noise)', fmt(m.chamfer_ours_to_target_px, 1) + ' px') +
+    row('chamfer target → ours (missing)', fmt(m.chamfer_target_to_ours_px, 1) + ' px') +
+    row('ink ratio ours/target (0.8–1.2)', fmt(m.ink_ratio_ours_to_target, 2), inkCls) +
+    row('ink px', `${m.ink_pixels_ours} / ${m.ink_pixels_target}`) +
+    row('path count (ref ≈ 30–60)', m.path_count) +
+    row('buttons ours / ref / matched (18)', `${m.buttons_ours} / ${m.buttons_target} / ${m.buttons_matched}`, btnCls) +
+    row('button position error', m.button_position_error_px == null ? '—' : fmt(m.button_position_error_px, 1) + ' px');
+  $('vinput').innerHTML = `<img src="${j.input}"/>`;
+  $('vours').innerHTML = j.svg;
+  $('vtarget').innerHTML = `<img src="${j.target}"/>`;
+  $('vonion').innerHTML = `<img src="${j.onion}"/>`;
+  const tbb = j.target_bbox_norm, obb = j.ours_bbox_norm;
+  $('otarget').src = j.target;
+  $('overlay').innerHTML = j.svg;
+  function layout(){
+    const Tw = $('otarget').clientWidth, Th = $('otarget').clientHeight;
+    if (!Tw) return;
+    const tw = (tbb[2]-tbb[0])*Tw, th = (tbb[3]-tbb[1])*Th;
+    const ow = (obb[2]-obb[0])*j.svg_width, oh = (obb[3]-obb[1])*j.svg_height;
+    const s = Math.max(tw, th) / Math.max(ow, oh);
+    const tcx = (tbb[0]+tbb[2])/2*Tw, tcy = (tbb[1]+tbb[3])/2*Th;
+    const ocx = (obb[0]+obb[2])/2*j.svg_width, ocy = (obb[1]+obb[3])/2*j.svg_height;
+    const ov = $('overlay');
+    ov.style.width = (j.svg_width*s)+'px';
+    ov.style.height = (j.svg_height*s)+'px';
+    ov.style.left = (tcx - s*ocx)+'px';
+    ov.style.top = (tcy - s*ocy)+'px';
+  }
+  $('otarget').onload = layout;
+  window.addEventListener('resize', layout);
+  setTimeout(layout, 300);
+  const apply = () => {
+    $('overlay').style.opacity = $('op').value/100;
+    $('overlay').style.display = $('showours').checked ? 'block' : 'none';
+    $('opv').textContent = $('op').value + '%';
+  };
+  $('op').oninput = apply; $('showours').onchange = apply; apply();
+}
+load();
+</script>
+</body>
+</html>"#;
 
 const INDEX_HTML: &str = r#"<!doctype html>
 <html lang="en">
@@ -266,7 +465,7 @@ const INDEX_HTML: &str = r#"<!doctype html>
 </style>
 </head>
 <body>
-<header><h1>im2vec — image → SVG</h1><p>Logo-first tracer (Rust + vtracer). <b>Paste</b> (⌘V / Ctrl+V), drag &amp; drop, or pick a file — it converts instantly. Download only if you like the result.</p></header>
+<header><h1>im2vec — image → SVG</h1><p>Logo-first tracer (Rust + vtracer). <b>Paste</b> (⌘V / Ctrl+V), drag &amp; drop, or pick a file — it converts instantly. Download only if you like the result. <a href="/eval" style="color:#8fb4ff">1:1 eval →</a></p></header>
 <main>
   <div class="panel">
     <label>Image (png / jpg / webp) — paste / drop / browse</label>
