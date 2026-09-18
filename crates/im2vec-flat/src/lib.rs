@@ -26,7 +26,7 @@ mod search;
 pub mod shading;
 mod template;
 use template::{
-    back_collar_template, front_collar_template, gorge_seam_template, lapel_template,
+    back_collar_template, front_collar_template, gorge_seam_template, lapel_template_with_peak,
     pocket_template, render_template, Placement, Template,
 };
 
@@ -253,6 +253,19 @@ fn convert_flat_rgb(rgb: &RgbImage, opts: &FlatOptions) -> Result<FlatOutput> {
             front.y1 as f32,
         );
     }
+    stage(&mut stages, "button snap", t);
+
+    // Shape-from-shading: estimate surface normals and curvature for
+    // 3D-structure-aware template placement. The curvature map reveals
+    // true fold lines (lapel roll, armhole seams) that 2D edge detection
+    // misses. Templates snap to these ridges instead of fixed fractions.
+    let t = Instant::now();
+    let gray = image::imageops::grayscale(rgb);
+    let (cw, ch) = (gray.width() as usize, gray.height() as usize);
+    let normals = shading::estimate_normals(&gray);
+    let curv = shading::curvature_from_normals(&normals, cw, ch);
+    let curvature_map = shading::CurvatureMap::new(curv, cw, ch);
+    stage(&mut stages, "shape-from-shading", t);
     stage(&mut stages, "button detection", t);
 
     // #19: Apply artist proportion compensation to the silhouette mask.
@@ -531,8 +544,14 @@ fn convert_flat_rgb(rgb: &RgbImage, opts: &FlatOptions) -> Result<FlatOutput> {
     // Phase 6: parametric structural linework (lapels, collar, pockets).
     // Solid edges in <g id="structure">, dashed details get per-path dash.
     // Chains are passed for photo-driven template alignment (#20 refinement).
-    let (struct_solid, struct_dashed) =
-        generate_structure(&buttons, &comps, &scaled, w as usize, h as usize);
+    let (struct_solid, struct_dashed) = generate_structure(
+        &buttons,
+        &comps,
+        &scaled,
+        w as usize,
+        h as usize,
+        &curvature_map,
+    );
     if !struct_solid.is_empty() || !struct_dashed.is_empty() {
         svg.push_str("<g id=\"structure\" fill=\"none\" stroke=\"#1a1a1a\" stroke-width=\"2\" stroke-linecap=\"round\" stroke-linejoin=\"round\">");
         for p in &struct_solid {
@@ -2250,6 +2269,7 @@ fn generate_structure(
     chains: &[Vec<(f32, f32)>],
     img_w: usize,
     img_h: usize,
+    curvature_map: &shading::CurvatureMap,
 ) -> StructurePaths {
     let mut solid = Vec::new();
     let mut dashed = Vec::new();
@@ -2384,7 +2404,24 @@ fn generate_structure(
             w: lapel_w,
             ..frame
         };
-        let lapel = lapel_template(vg, vb);
+        // Snap lapel keypoints to curvature ridges (true 3D fold lines).
+        // The template's fixed fractions are a starting guess; the curvature
+        // map reveals where the folds actually are in this garment.
+        let (vg_snap, peak_x_snap) = {
+            let notch_px = (cx + 0.14 * w, y0 + vg * h);
+            let peak_px = (cx + 0.30 * w, y0 + (vg + 0.020) * h);
+            let (_nx, ny) = curvature_map.snap_to_ridge(notch_px.0, notch_px.1, 25.0, 0.3);
+            let (px, py) = curvature_map.snap_to_ridge(peak_px.0, peak_px.1, 30.0, 0.3);
+            // Convert back to normalized: vg from snapped notch y, peak_x from snapped peak x.
+            let vg_s = (ny - y0) / h;
+            let peak_x_s = ((px - cx) / w).abs().max(0.20).min(0.40);
+            // Only accept the snap if it's within reasonable bounds of the default.
+            let vg_final = if (vg_s - vg).abs() < 0.05 { vg_s } else { vg };
+            // Peak y should stay near vg; use snapped x but keep y relationship.
+            let _ = py; // peak y snap unused for now; x is the critical fix
+            (vg_final, peak_x_s)
+        };
+        let lapel = lapel_template_with_peak(vg_snap, vb, peak_x_snap);
         for mirror in [true, false] {
             let side_frame = Placement {
                 mirror,
@@ -3417,7 +3454,10 @@ mod tests {
                 cy: 566.0,
             },
         ];
-        let (solid, dashed) = generate_structure(&buttons, &comps, &[], 1600, 900);
+        // Dummy curvature map for test (empty, no snapping will occur).
+        let dummy_curv = vec![0.0f32; 1600 * 900];
+        let dummy_map = shading::CurvatureMap::new(dummy_curv, 1600, 900);
+        let (solid, dashed) = generate_structure(&buttons, &comps, &[], 1600, 900, &dummy_map);
         // Front: 2 lapel edges + 2 roll lines + 1 gorge + 2 notch ticks (in edge)
         //        + 2 pockets = ~9 solid; back: collar (4) = 4 solid.
         // Dashed: 2 lapel stitch + 2 pocket stitch + 1 collar stitch + 1 back seam.
@@ -3454,7 +3494,9 @@ mod tests {
                 symmetrized: true,
             },
         ];
-        let (solid, dashed) = generate_structure(&[], &comps, &[], 1600, 900);
+        let dummy_curv = vec![0.0f32; 1600 * 900];
+        let dummy_map = shading::CurvatureMap::new(dummy_curv, 1600, 900);
+        let (solid, dashed) = generate_structure(&[], &comps, &[], 1600, 900, &dummy_map);
         assert!(solid.is_empty() && dashed.is_empty());
     }
 }

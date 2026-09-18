@@ -119,6 +119,57 @@ pub fn render_curvature(curv: &[f32], w: u32, h: u32) -> GrayImage {
     img
 }
 
+/// Curvature map for snapping template keypoints to real 3D fold ridges.
+///
+/// Unlike edge-based snapping (which finds 2D color boundaries), this finds
+/// the actual 3D fold lines from shape-from-shading curvature. Template
+/// keypoints (lapel notch, peak, etc.) snap to the nearest high-curvature
+/// ridge within the search radius.
+pub struct CurvatureMap {
+    curv: Vec<f32>,
+    w: usize,
+    h: usize,
+}
+
+impl CurvatureMap {
+    pub fn new(curv: Vec<f32>, w: usize, h: usize) -> Self {
+        Self { curv, w, h }
+    }
+
+    /// Snap (x, y) to the maximum-curvature pixel within `radius`.
+    /// Returns the snapped position, or the original if no strong ridge found.
+    /// `min_strength` is the curvature threshold (0.0-1.0 normalized).
+    pub fn snap_to_ridge(&self, x: f32, y: f32, radius: f32, min_strength: f32) -> (f32, f32) {
+        let max_c = self.curv.iter().cloned().fold(0.0f32, f32::max).max(1e-6);
+        let r = radius as isize;
+        let xi = x as isize;
+        let yi = y as isize;
+
+        let mut best = (x, y);
+        let mut best_c = min_strength * max_c;
+
+        for dy in -r..=r {
+            for dx in -r..=r {
+                let xx = xi + dx;
+                let yy = yi + dy;
+                if xx < 0 || yy < 0 || xx >= self.w as isize || yy >= self.h as isize {
+                    continue;
+                }
+                // Circular window
+                if dx * dx + dy * dy > r * r {
+                    continue;
+                }
+                let c = self.curv[yy as usize * self.w + xx as usize];
+                if c > best_c {
+                    best_c = c;
+                    best = (xx as f32, yy as f32);
+                }
+            }
+        }
+        best
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
