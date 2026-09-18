@@ -220,25 +220,29 @@ pub fn lapel_template(vg: f32, vb: f32) -> Template {
     // Photo-measured (blazer): peak sits ~0.05w outboard and ~0.03h below the
     // notch; the old fixed (0.25, 0.24) put it ~50px too low and too far out,
     // rendering a rounded shield instead of a sharp peak lapel.
+    // Target-measured: peak is WIDE at 0.30w outboard (not 0.19w) for the
+    // broad angular lapel; notch at 0.14w where collar meets lapel.
     let notch = (0.14f32, vg);
-    let peak = (0.19f32, vg + 0.030f32);
-    let brk = (0.09f32, vb);
+    let peak = (0.30f32, vg + 0.020f32);
+    let brk = (0.12f32, vb);
     // Peak -> break gentle curve, cubic control points (transcribed).
     let c1 = (peak.0, peak.1 + (brk.1 - peak.1) * 0.35);
     let c2 = (
         peak.0 + (brk.0 - peak.0) * 0.3,
         brk.1 - (brk.1 - peak.1) * 0.25,
     );
-    // Roll line: the V from neck to button.
+    // Roll line: the V from neck to button. Target shows it nearly vertical,
+    // ending at the top button.
     let roll = vec![
-        TPoint::Norm(0.14 * 0.55, 0.06 + 0.01),
-        TPoint::Norm(0.14 * 0.42, (0.06 + vb) * 0.5),
-        TPoint::NormPx(0.09 * 0.5, vb, 0.0, -4.0),
+        TPoint::Norm(0.10, vg + 0.01),
+        TPoint::Norm(0.08, (vg + vb) * 0.5),
+        TPoint::NormPx(0.06, vb, 0.0, -4.0),
     ];
     Template {
         name: "lapel",
         paths: vec![
-            // Outer edge: notch -> peak (straight).
+            // Outer edge: notch -> peak (straight). Sharp angle at notch
+            // where collar overlaps.
             TPath::solid(vec![
                 TPoint::Norm(notch.0, notch.1),
                 TPoint::Norm(peak.0, peak.1),
