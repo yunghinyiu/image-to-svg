@@ -216,8 +216,12 @@ fn rounded_rect_uv(
 /// reference tech pack: notch at 0.14w, peak at 0.25w / 0.24h, break at
 /// 0.09w; dashed topstitching inset 9px; roll line from neck to button.
 pub fn lapel_template(vg: f32, vb: f32) -> Template {
+    // #33: peak placed relative to the notch (vg), not at a fixed v.
+    // Photo-measured (blazer): peak sits ~0.05w outboard and ~0.03h below the
+    // notch; the old fixed (0.25, 0.24) put it ~50px too low and too far out,
+    // rendering a rounded shield instead of a sharp peak lapel.
     let notch = (0.14f32, vg);
-    let peak = (0.25f32, 0.24f32);
+    let peak = (0.19f32, vg + 0.030f32);
     let brk = (0.09f32, vb);
     // Peak -> break gentle curve, cubic control points (transcribed).
     let c1 = (peak.0, peak.1 + (brk.1 - peak.1) * 0.35);
