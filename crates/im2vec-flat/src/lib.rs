@@ -294,8 +294,37 @@ fn convert_flat_rgb(rgb: &RgbImage, opts: &FlatOptions) -> Result<FlatOutput> {
     let mut folds: Vec<&Vec<(f32, f32)>> = Vec::new();
     let mut stitches: Vec<Vec<(f32, f32)>> = Vec::new();
     let mut n_noise = 0;
-    for c in &scaled {
-        match classify_chain(c, &edge_band, rgb, w as usize, h as usize) {
+    // Optional experiment override: IM2VEC_LABELS_JSON points at a flat JSON
+    // object {"<chain_id>": "seam"|"stitch"|"fold"|"noise"} (e.g. Jev decisions)
+    // that replaces the heuristic classifier for this run.
+    let label_override = load_label_override();
+    // Per-chain labels, parallel to `scaled` (for the Jev prototype dump).
+    let mut labels: Vec<&str> = Vec::with_capacity(scaled.len());
+    for (idx, c) in scaled.iter().enumerate() {
+        let kind = match label_override
+            .as_ref()
+            .and_then(|m| m.get(&idx))
+            .map(|s| s.as_str())
+        {
+            Some("seam") => ChainKind::Seam,
+            Some("stitch") => ChainKind::Stitch,
+            Some("fold") => ChainKind::Fold,
+            Some("noise") => ChainKind::Noise,
+            Some(other) => {
+                eprintln!(
+                    "IM2VEC_LABELS_JSON: unknown label '{other}' for chain {idx}, using heuristic"
+                );
+                classify_chain(c, &edge_band, rgb, w as usize, h as usize)
+            }
+            None => classify_chain(c, &edge_band, rgb, w as usize, h as usize),
+        };
+        labels.push(match kind {
+            ChainKind::Seam => "seam",
+            ChainKind::Stitch => "stitch",
+            ChainKind::Fold => "fold",
+            ChainKind::Noise => "noise",
+        });
+        match kind {
             ChainKind::Seam => seams.push(c),
             ChainKind::Stitch => {
                 // Aggressive smoothing for clean dashed lines.
@@ -308,6 +337,11 @@ fn convert_flat_rgb(rgb: &RgbImage, opts: &FlatOptions) -> Result<FlatOutput> {
             }
             ChainKind::Noise => n_noise += 1,
         }
+    }
+    if let Ok(dump_path) = std::env::var("IM2VEC_DUMP_CHAINS") {
+        dump_chain_features(
+            &dump_path, &scaled, &labels, &edge_band, rgb, w as usize, h as usize,
+        );
     }
     if std::env::var("IM2VEC_FLAT_DEBUG").is_ok() {
         eprintln!(
@@ -1536,14 +1570,78 @@ fn straightness(c: &[(f32, f32)]) -> f32 {
     }
 }
 
+/// Mean luminance and bright-sample fraction along a chain (output coords).
+/// Used to tell white topstitching thread from blue denim.
+fn chain_brightness(c: &[(f32, f32)], rgb: &RgbImage, w: usize, h: usize) -> (f32, f32) {
+    let mut sum = 0.0f32;
+    let mut bright = 0usize;
+    let mut total = 0usize;
+    for &(px, py) in c.iter().step_by(2) {
+        let xi = (px as usize).min(w - 1);
+        let yi = (py as usize).min(h - 1);
+        let p = rgb.get_pixel(xi as u32, yi as u32);
+        let lum = 0.299 * p[0] as f32 + 0.587 * p[1] as f32 + 0.114 * p[2] as f32;
+        sum += lum;
+        total += 1;
+        if lum > 130.0 {
+            bright += 1;
+        }
+    }
+    if total == 0 {
+        (0.0, 0.0)
+    } else {
+        (sum / total as f32, bright as f32 / total as f32)
+    }
+}
+
+/// Fraction of chain points inside the silhouette edge band.
+fn chain_edge_frac(c: &[(f32, f32)], edge_band: &[bool], w: usize, h: usize) -> f32 {
+    if c.is_empty() {
+        return 0.0;
+    }
+    let near = c
+        .iter()
+        .filter(|&&(px, py)| {
+            let xi = px as usize;
+            let yi = py as usize;
+            xi < w && yi < h && edge_band[yi * w + xi]
+        })
+        .count();
+    near as f32 / c.len() as f32
+}
+
+/// Bounding box and centroid of a chain (output coords).
+fn chain_bbox_centroid(c: &[(f32, f32)]) -> ((f32, f32, f32, f32), (f32, f32)) {
+    let (mut x0, mut y0, mut x1, mut y1) = (
+        f32::INFINITY,
+        f32::INFINITY,
+        f32::NEG_INFINITY,
+        f32::NEG_INFINITY,
+    );
+    let (mut sx, mut sy) = (0.0f32, 0.0f32);
+    for &(px, py) in c {
+        x0 = x0.min(px);
+        y0 = y0.min(py);
+        x1 = x1.max(px);
+        y1 = y1.max(py);
+        sx += px;
+        sy += py;
+    }
+    let n = c.len().max(1) as f32;
+    ((x0, y0, x1, y1), (sx / n, sy / n))
+}
+
 /// Classify a chain in output-pixel coords (after sxx/syy scaling).
-/// Thresholds from blazer chain stats: 173/203 paths < 100px (texture),
-/// ~30 long/straight (seams).
 /// `edge_band`: mask of pixels within STITCH_EDGE_DIST of the silhouette
 /// boundary (precomputed).
 /// `rgb`: source image for brightness check (white stitching vs blue denim).
-/// Short bright chains near edges or linear are photo topstitching (Stitch);
-/// short dark/medium chains are texture (Noise).
+///
+/// v2 thresholds distilled from the Jev prototype experiment (2026-09-18):
+/// Jev promoted 56/117 heuristic "folds" to seam/stitch with 64% ground-truth
+/// confirmation, revealing two systematic blind spots in the v1 cutoffs:
+/// straight dark chains just under the 90px seam cutoff (near-miss seams),
+/// and medium-length bright chains hugging the silhouette edge (topstitching
+/// rows the old len<25 gate excluded).
 fn classify_chain(
     c: &[(f32, f32)],
     edge_band: &[bool],
@@ -1552,42 +1650,102 @@ fn classify_chain(
     h: usize,
 ) -> ChainKind {
     let len = arc_len(c);
-    if len > 90.0 && straightness(c) > 0.85 {
+    let straight = straightness(c);
+    let (_, bright_frac) = chain_brightness(c, rgb, w, h);
+    let edge_frac = chain_edge_frac(c, edge_band, w, h);
+    // Seam: long + straight structural lines, or medium + very straight +
+    // dark near-miss seams (front edges, plackets).
+    if (len > 90.0 && straight > 0.85) || (len > 45.0 && straight > 0.95 && bright_frac < 0.35) {
         return ChainKind::Seam;
     }
     if len < 25.0 {
         // Sample brightness: white stitching (L>130) vs blue denim (L~110-120).
         // Note: chains sit on stitch edges, so sample is mixed; threshold low.
-        let mut bright = 0;
-        let mut total = 0;
-        for &(px, py) in c.iter().step_by(2) {
-            let xi = (px as usize).min(w - 1);
-            let yi = (py as usize).min(h - 1);
-            let p = rgb.get_pixel(xi as u32, yi as u32);
-            let lum = 0.299 * p[0] as f32 + 0.587 * p[1] as f32 + 0.114 * p[2] as f32;
-            total += 1;
-            if lum > 130.0 {
-                bright += 1;
-            }
-        }
-        let is_bright = total > 0 && bright * 2 >= total;
+        let is_bright = bright_frac >= 0.5;
         // Near-edge short chains = photo topstitching (hem/cuff/front edge).
-        let near = c
-            .iter()
-            .filter(|&&(px, py)| {
-                let xi = px as usize;
-                let yi = py as usize;
-                xi < w && yi < h && edge_band[yi * w + xi]
-            })
-            .count();
-        let near_edge = near * 2 >= c.len();
+        let near_edge = edge_frac >= 0.5;
         // Bright + (near edge OR linear) = stitching; else texture.
-        if is_bright && (near_edge || straightness(c) > 0.7) {
+        if is_bright && (near_edge || straight > 0.7) {
             return ChainKind::Stitch;
         }
         return ChainKind::Noise;
     }
+    // Medium-length bright chains hugging the silhouette edge are topstitching.
+    if bright_frac >= 0.4 && edge_frac >= 0.6 {
+        return ChainKind::Stitch;
+    }
     ChainKind::Fold
+}
+
+/// Prototype-only: load a per-chain label override from
+/// `IM2VEC_LABELS_JSON`, a flat JSON object like `{"0":"seam","1":"noise"}`.
+/// Hand-rolled parser (no new deps); returns None when unset/unreadable.
+fn load_label_override() -> Option<std::collections::HashMap<usize, String>> {
+    let path = std::env::var("IM2VEC_LABELS_JSON").ok()?;
+    let text = std::fs::read_to_string(&path).ok()?;
+    let mut map = std::collections::HashMap::new();
+    for pair in text
+        .trim()
+        .trim_matches(|c| c == '{' || c == '}')
+        .split(',')
+    {
+        let mut kv = pair.splitn(2, ':');
+        let (k, v) = (kv.next()?.trim(), kv.next()?.trim());
+        let id: usize = k.trim_matches('"').parse().ok()?;
+        map.insert(id, v.trim_matches('"').to_string());
+    }
+    if map.is_empty() {
+        eprintln!("IM2VEC_LABELS_JSON: no labels parsed from {path}");
+        return None;
+    }
+    Some(map)
+}
+
+/// Debug/ML-prototype dump: one JSON object per chain with the features the
+/// heuristic classifier uses plus its label. Enable with
+/// `IM2VEC_DUMP_CHAINS=/path/to/chains.json`. Hand-rolled JSON (no new deps).
+fn dump_chain_features(
+    path: &str,
+    scaled: &[Vec<(f32, f32)>],
+    labels: &[&str],
+    edge_band: &[bool],
+    rgb: &RgbImage,
+    w: usize,
+    h: usize,
+) {
+    let mut out = String::from("{\"image_width\":");
+    out.push_str(&format!("{w},\"image_height\":{h},\"chains\":["));
+    for (i, (c, label)) in scaled.iter().zip(labels.iter()).enumerate() {
+        let (mean_lum, bright_frac) = chain_brightness(c, rgb, w, h);
+        let edge_frac = chain_edge_frac(c, edge_band, w, h);
+        let ((x0, y0, x1, y1), (cx, cy)) = chain_bbox_centroid(c);
+        if i > 0 {
+            out.push(',');
+        }
+        out.push_str(&format!(
+            "{{\"id\":{i},\"label\":\"{label}\",\"n_points\":{},\"arc_len\":{:.1},\
+             \"straightness\":{:.3},\"mean_lum\":{:.1},\"bright_frac\":{:.2},\
+             \"edge_frac\":{:.2},\"bbox\":[{x0:.1},{y0:.1},{x1:.1},{y1:.1}],\
+             \"centroid\":[{cx:.1},{cy:.1}],\"points\":[",
+            c.len(),
+            arc_len(c),
+            straightness(c),
+            mean_lum,
+            bright_frac,
+            edge_frac,
+        ));
+        for (j, &(px, py)) in c.iter().enumerate() {
+            if j > 0 {
+                out.push(',');
+            }
+            out.push_str(&format!("[{px:.1},{py:.1}]"));
+        }
+        out.push_str("]}");
+    }
+    out.push_str("]}");
+    if let Err(e) = std::fs::write(path, out) {
+        eprintln!("IM2VEC_DUMP_CHAINS: failed to write {path}: {e}");
+    }
 }
 
 /// Generate procedural topstitching (dashed) as inward offsets of the

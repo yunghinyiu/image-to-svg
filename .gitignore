@@ -2,3 +2,13 @@
 **/target
 .DS_Store
 /outputs/
+
+# Secrets: this repo is public. API keys, tokens, and credentials must NEVER
+# be committed. Keys live in the Secure Vault (connector), never in files.
+.env
+.env.*
+*.pem
+*.key
+*credentials*.json
+*secret*.json
+config/secrets/
