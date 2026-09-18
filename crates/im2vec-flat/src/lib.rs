@@ -1065,7 +1065,7 @@ fn merge_collinear(chains: &mut Vec<Vec<(f32, f32)>>, gap: f32) {
                         if dist > gap * LONG_REACH_MULT {
                             continue;
                         }
-let dist = ((pi.0 - pj.0).powi(2) + (pi.1 - pj.1).powi(2)).sqrt();
+                        let dist = ((pi.0 - pj.0).powi(2) + (pi.1 - pj.1).powi(2)).sqrt();
                         if dist > gap * LONG_REACH_MULT {
                             continue;
                         }
@@ -1314,7 +1314,11 @@ fn ellipse_trace(loop_pts: &[(f32, f32)]) -> Vec<(f32, f32)> {
     let lambda2 = (t - d.sqrt()) / 2.0;
     let a = lambda1.sqrt().max(1.0); // semi-major axis
     let b = lambda2.sqrt().max(1.0); // semi-minor axis
-    let angle = if sxy.abs() < 1e-6 { 0.0 } else { (sxy / (sxx - syy + 1e-6)).atan() / 2.0 };
+    let angle = if sxy.abs() < 1e-6 {
+        0.0
+    } else {
+        (sxy / (sxx - syy + 1e-6)).atan() / 2.0
+    };
     let mut poly: Vec<(f32, f32)> = (0..=7)
         .map(|k| {
             let theta = k as f32 * std::f32::consts::PI / 4.0 + angle;
