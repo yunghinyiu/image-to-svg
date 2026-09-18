@@ -11,6 +11,12 @@ use serde::Serialize;
 use std::time::Instant;
 
 #[derive(Serialize)]
+struct StageView {
+    name: String,
+    elapsed_ms: u128,
+}
+
+#[derive(Serialize)]
 struct ConvertResponse {
     svg: String,
     width: u32,
@@ -18,6 +24,17 @@ struct ConvertResponse {
     path_count: usize,
     svg_bytes: usize,
     elapsed_ms: u128,
+    stages: Vec<StageView>,
+    /// data-URL PNGs of intermediate artifacts (flat preset only)
+    mask_preview: Option<String>,
+    lines_preview: Option<String>,
+}
+
+fn data_url(png: Option<Vec<u8>>) -> Option<String> {
+    png.map(|b| {
+        use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
+        format!("data:image/png;base64,{}", B64.encode(&b))
+    })
 }
 
 async fn index() -> Html<&'static str> {
@@ -134,7 +151,10 @@ async fn api_convert(mut mp: Multipart) -> Result<Json<ConvertResponse>, (Status
         })
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("task: {e}")))?
-        .map_err(|e| (StatusCode::UNPROCESSABLE_ENTITY, format!("flat: {e:#}")))?;
+        .map_err(|e| {
+            eprintln!("im2vec-web flat error: {e:#}");
+            (StatusCode::UNPROCESSABLE_ENTITY, format!("flat: {e:#}"))
+        })?;
         return Ok(Json(ConvertResponse {
             svg: out.svg,
             width: out.width,
@@ -142,20 +162,40 @@ async fn api_convert(mut mp: Multipart) -> Result<Json<ConvertResponse>, (Status
             path_count: out.path_count,
             svg_bytes: out.svg_bytes,
             elapsed_ms: t.elapsed().as_millis(),
+            stages: out
+                .stages
+                .into_iter()
+                .map(|s| StageView {
+                    name: s.name,
+                    elapsed_ms: s.elapsed_ms,
+                })
+                .collect(),
+            mask_preview: data_url(out.mask_preview_png),
+            lines_preview: data_url(out.lines_preview_png),
         }));
     }
     let out = tokio::task::spawn_blocking(move || convert_bytes(&bytes, &opts))
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("task: {e}")))?
-        .map_err(|e| (StatusCode::UNPROCESSABLE_ENTITY, format!("convert: {e:#}")))?;
+        .map_err(|e| {
+            eprintln!("im2vec-web convert error: {e:#}");
+            (StatusCode::UNPROCESSABLE_ENTITY, format!("convert: {e:#}"))
+        })?;
 
+    let ms = t.elapsed().as_millis();
     Ok(Json(ConvertResponse {
         svg: out.svg,
         width: out.width,
         height: out.height,
         path_count: out.path_count,
         svg_bytes: out.svg_bytes,
-        elapsed_ms: t.elapsed().as_millis(),
+        elapsed_ms: ms,
+        stages: vec![StageView {
+            name: "vtracer trace".into(),
+            elapsed_ms: ms,
+        }],
+        mask_preview: None,
+        lines_preview: None,
     }))
 }
 
@@ -188,7 +228,7 @@ const INDEX_HTML: &str = r#"<!doctype html>
   body { font-family: ui-sans-serif, system-ui, sans-serif; margin: 0; background: #0f1115; color: #e8eaf0; }
   header { padding: 20px 24px; border-bottom: 1px solid #262b36; }
   header h1 { margin: 0; font-size: 20px; } header p { margin: 4px 0 0; color: #9aa3b2; font-size: 13px;}
-  main { display: grid; grid-template-columns: 320px 1fr; gap: 16px; padding: 16px 24px; }
+  main { display: grid; grid-template-columns: 320px 1fr 300px; gap: 16px; padding: 16px 24px; }
   .panel { background: #171b22; border: 1px solid #262b36; border-radius: 12px; padding: 16px; }
   label { display: block; font-size: 12px; color: #9aa3b2; margin: 12px 0 4px; }
   select, input[type=number], input[type=text] { width: 100%; padding: 8px; border-radius: 8px; border: 1px solid #2e3542; background: #0f1319; color: inherit; }
@@ -201,9 +241,15 @@ const INDEX_HTML: &str = r#"<!doctype html>
   .view img, .view svg { max-width: 100%; max-height: 60vh; background: white; border-radius: 6px;}
   .stats { font-size: 12px; color: #9aa3b2; margin-top: 8px; white-space: pre-wrap;}
   .row { display: flex; gap: 8px; } .row > * { flex: 1; }
+  .stage { margin: 10px 0; } .srow { display: flex; justify-content: space-between; font-size: 12px; color: #c6ccd8;}
+  .bar { height: 6px; background: #262b36; border-radius: 3px; margin-top: 4px; } .bar i { display: block; height: 100%; background: #5b8cff; border-radius: 3px; }
+  #thumbs { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; margin-top: 10px; } #thumbs img { width: 100%; background: #fff; border-radius: 6px; }
+  #params { font-size: 12px; color: #9aa3b2; margin-top: 10px; }
+  .live { font-size: 11px; color: #7ee2a8; margin-top: 6px; }
   a.dl { display: none; margin-top: 8px; font-size: 13px; color: #8fb4ff; }
   .hint { font-size: 12px; color: #9aa3b2; margin-top: 6px; min-height: 16px; word-break: break-all;}
   body.dragover::after { content: 'Drop image to convert'; position: fixed; inset: 0; display: flex; align-items: center; justify-content: center; font-size: 28px; font-weight: 700; background: rgba(91,140,255,.18); backdrop-filter: blur(2px); border: 4px dashed #5b8cff; z-index: 99; pointer-events: none; }
+  @media (max-width: 1200px){ main{grid-template-columns:320px 1fr;} #pipe{grid-column:1/-1;} }
   @media (max-width: 900px){ main{grid-template-columns:1fr;} .views{grid-template-columns:1fr;} }
 </style>
 </head>
@@ -244,6 +290,7 @@ const INDEX_HTML: &str = r#"<!doctype html>
       <div><label>Watershed detail</label><select id="watershed_detail"><option value="64">64 — small</option><option value="128">128 — medium</option><option value="160" selected>160 — high</option><option value="192">192 — max</option></select></div>
     </div>
     <button id="go">Convert to SVG</button>
+    <div class="live">● live — changing any setting re-converts automatically</div>
     <div class="stats" id="stats">No conversion yet.</div>
     <a class="dl" id="dl" style="display:none">Download SVG</a>
   </div>
@@ -252,6 +299,12 @@ const INDEX_HTML: &str = r#"<!doctype html>
       <div><label>Original</label><div class="view" id="orig"><span style="color:#666">—</span></div></div>
       <div><label>Vectorized SVG (rendered)</label><div class="view" id="vec"><span style="color:#666">—</span></div></div>
     </div>
+  </div>
+  <div class="panel" id="pipe">
+    <b>Pipeline</b>
+    <div id="stages"><span style="color:#666">Convert an image to see each stage.</span></div>
+    <div id="thumbs"></div>
+    <div id="params"></div>
   </div>
 </main>
 <script>
@@ -285,15 +338,24 @@ $('file').onchange = e => {
   const f = e.target.files[0]; if (!f) return;
   setFile(f, f.name);
 };
-// Paste: copy any image (screenshot, right-click → Copy image) then ⌘V/Ctrl+V here.
+// Paste: screenshots / copied images come as image/* items; files copied in
+// Finder/Explorer often arrive with an empty MIME type, so fall back to
+// clipboardData.files plus an extension check. Never fail silently.
 window.addEventListener('paste', e => {
-  const items = (e.clipboardData && e.clipboardData.items) || [];
-  for (const it of items) {
+  const cd = e.clipboardData;
+  if (!cd) return;
+  for (const it of cd.items || []) {
     if (it.type && it.type.startsWith('image/')) {
       const f = it.getAsFile();
       if (f) { e.preventDefault(); setFile(f, 'pasted-image.png'); return; }
     }
   }
+  for (const f of cd.files || []) {
+    if ((f.type && f.type.startsWith('image/')) || /\.(png|jpe?g|webp|gif|bmp|tiff?|svg)$/i.test(f.name || '')) {
+      e.preventDefault(); setFile(f, f.name || 'pasted-image.png'); return;
+    }
+  }
+  $('fname').textContent = 'Clipboard had no image — try drag & drop or the file picker.';
 });
 // Drag & drop anywhere on the page.
 window.addEventListener('dragover', e => { e.preventDefault(); document.body.classList.add('dragover'); });
@@ -304,6 +366,7 @@ window.addEventListener('drop', e => {
   if (f && f.type.startsWith('image/')) setFile(f, f.name);
 });
 async function convert() {
+  const myReq = ++reqSeq;
   const f = currentFile || $('file').files[0];
   if (!f) { alert('Paste, drop, or pick an image first'); return; }
   $('go').disabled = true; $('stats').textContent = 'Converting…';
@@ -326,15 +389,43 @@ async function convert() {
     const r = await fetch('/api/convert', { method: 'POST', body: fd });
     if (!r.ok) throw new Error(await r.text());
     const j = await r.json();
+    if (myReq !== reqSeq) return; // a newer live conversion superseded this one
     lastSvg = j.svg;
     $('vec').innerHTML = j.svg;
     $('stats').textContent = `${j.width}x${j.height}  •  ${j.path_count} paths  •  ${(j.svg_bytes/1024).toFixed(1)} KB svg  •  ${j.elapsed_ms} ms`;
+    renderPipeline(j);
     const blob = new Blob([j.svg], {type:'image/svg+xml'});
     const dlName = (currentName.replace(/\.[^.]+$/, '') || 'output') + '.svg';
     const a = $('dl'); a.style.display='inline'; a.href = URL.createObjectURL(blob); a.download = dlName;
     a.textContent = '⬇ Download ' + dlName;
   } catch(e){ $('stats').textContent = 'Error: ' + e.message; }
   $('go').disabled = false;
+}
+let liveT = null, reqSeq = 0;
+function hasImage(){ return currentFile || ($('file').files && $('file').files[0]); }
+function scheduleConvert(){
+  if (!hasImage() || $('go').disabled) return;
+  clearTimeout(liveT);
+  liveT = setTimeout(() => convert(), 450);
+}
+// Live preview: any control except the file picker re-converts (debounced).
+document.querySelector('main .panel').addEventListener('input', e => {
+  if (e.target && e.target.id !== 'file') scheduleConvert();
+});
+function renderPipeline(j){
+  const total = (j.stages || []).reduce((a, s) => a + s.elapsed_ms, 0) || 1;
+  $('stages').innerHTML = (j.stages || []).map(s => {
+    const w = Math.max(4, Math.round(s.elapsed_ms / total * 100));
+    return `<div class="stage"><div class="srow"><span>${s.name}</span><span>${s.elapsed_ms} ms</span></div><div class="bar"><i style="width:${w}%"></i></div></div>`;
+  }).join('') || '<span style="color:#666">—</span>';
+  let h = '';
+  if (j.mask_preview) h += `<div><label>mask</label><img src="${j.mask_preview}"/></div>`;
+  if (j.lines_preview) h += `<div><label>linework</label><img src="${j.lines_preview}"/></div>`;
+  $('thumbs').innerHTML = h;
+  const preset = $('preset').value;
+  $('params').textContent = preset === 'flat'
+    ? 'flatlay · symmetrized · outline 2.0px · detail 0.6'
+    : `${preset} · ${$('mode').value} · ${$('hierarchical').value} · ${$('clustering').value}`;
 }
 $('go').onclick = convert;
 </script>
