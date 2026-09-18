@@ -321,39 +321,43 @@ pub fn pocket_template(w: f32, h: f32) -> Template {
 /// Back view: collar band (top/bottom edges + sides), dashed topstitching
 /// along the collar bottom, and the dashed center back seam.
 pub fn back_collar_template() -> Template {
+    // #36: collar bottom extended to v=0.13 (was 0.09) so it overlaps the
+    // back silhouette instead of floating above it with a gap. The collar
+    // sits ON the back; drawn after the silhouette it renders on top.
+    // Widened 0.15->0.17 to match the target's broad flat collar.
     Template {
         name: "back-collar",
         paths: vec![
             // Collar top edge.
             TPath::solid(vec![
-                TPoint::Norm(-0.15, 0.02 + 0.008),
+                TPoint::Norm(-0.17, 0.02 + 0.006),
                 TPoint::Norm(0.0, 0.02),
-                TPoint::Norm(0.15, 0.02 + 0.008),
+                TPoint::Norm(0.17, 0.02 + 0.006),
             ]),
             // Collar bottom edge (gorge seam).
             TPath::solid(vec![
-                TPoint::Norm(-0.15 * 1.05, 0.09),
-                TPoint::Norm(0.0, 0.09 - 0.006),
-                TPoint::Norm(0.15 * 1.05, 0.09),
+                TPoint::Norm(-0.17 * 1.05, 0.13),
+                TPoint::Norm(0.0, 0.13 - 0.006),
+                TPoint::Norm(0.17 * 1.05, 0.13),
             ]),
             // Collar sides.
             TPath::solid(vec![
-                TPoint::Norm(-0.15, 0.02 + 0.008),
-                TPoint::Norm(-0.15 * 1.05, 0.09),
+                TPoint::Norm(-0.17, 0.02 + 0.006),
+                TPoint::Norm(-0.17 * 1.05, 0.13),
             ]),
             TPath::solid(vec![
-                TPoint::Norm(0.15, 0.02 + 0.008),
-                TPoint::Norm(0.15 * 1.05, 0.09),
+                TPoint::Norm(0.17, 0.02 + 0.006),
+                TPoint::Norm(0.17 * 1.05, 0.13),
             ]),
             // Dashed topstitching along collar bottom.
             TPath::dashed(vec![
-                TPoint::NormPx(-0.15 * 1.05, 0.09, 4.0, -5.0),
-                TPoint::NormPx(0.0, 0.09 - 0.006, 0.0, -5.0),
-                TPoint::NormPx(0.15 * 1.05, 0.09, -4.0, -5.0),
+                TPoint::NormPx(-0.17 * 1.05, 0.13, 4.0, -5.0),
+                TPoint::NormPx(0.0, 0.13 - 0.006, 0.0, -5.0),
+                TPoint::NormPx(0.17 * 1.05, 0.13, -4.0, -5.0),
             ]),
             // Center back seam (dashed).
             TPath::dashed(vec![
-                TPoint::NormPx(0.0, 0.09, 0.0, 8.0),
+                TPoint::NormPx(0.0, 0.13, 0.0, 8.0),
                 TPoint::Norm(0.0, 0.95),
             ]),
         ],
