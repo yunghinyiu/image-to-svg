@@ -2404,30 +2404,30 @@ fn generate_structure(
             w: lapel_w,
             ..frame
         };
-        // Snap lapel keypoints to curvature ridges (true 3D fold lines).
-        // The template's fixed fractions are a starting guess; the curvature
-        // map reveals where the folds actually are in this garment.
-        let (vg_snap, peak_x_snap) = {
+        // TRACE lapel: template-guided, ridge-snapped.
+        // Generate template points, snap each to nearest curvature ridge.
+        // This constrains the shape to the expected lapel while aligning
+        // to true folds (avoids wandering into random wrinkles).
+        let (vg_snap, _) = {
             let notch_px = (cx + 0.11 * w, y0 + vg * h);
             let (_nx, ny) = curvature_map.snap_to_ridge(notch_px.0, notch_px.1, 25.0, 0.3);
-            // Convert back to normalized: vg from snapped notch y.
             let vg_s = (ny - y0) / h;
-            // Peak x: 0.26 (further out than notch 0.16 for the jut).
-            let peak_x_s = 0.26f32;
-            eprintln!("[lapel-snap] vg {:.3}->{:.3} peak_x fixed 0.26", vg, vg_s);
-            // Only accept the snap if it's within reasonable bounds of the default.
             let vg_final = if (vg_s - vg).abs() < 0.05 { vg_s } else { vg };
-            (vg_final, peak_x_s)
+            eprintln!("[lapel-trace] vg {:.3}->{:.3}", vg, vg_final);
+            (vg_final, 0.0f32)
         };
-        let lapel = lapel_template_with_peak(vg_snap, vb, peak_x_snap);
         for mirror in [true, false] {
             let side_frame = Placement {
                 mirror,
                 ..lapel_frame
             };
+            // Template lapel: break -> notch -> peak -> brk
+            // (No curvature snap — the map is too noisy, jumps to wrinkles.
+            //  Template position comes from detector; shape is the focus.)
+            // Peak x=0.15 per target measurement (was 0.26, too far out).
+            let lapel = lapel_template_with_peak(vg_snap, vb, 0.15);
             push_rendered(&mut solid, &mut dashed, &lapel, &side_frame);
-            // Gorge seam is drawn once, after the left (mirrored) side,
-            // matching the original loop's `if side < 0.0` placement.
+            // Gorge seam (drawn once)
             if mirror {
                 push_rendered(
                     &mut solid,

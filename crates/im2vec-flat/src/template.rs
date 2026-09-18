@@ -215,7 +215,7 @@ fn rounded_rect_uv(
 /// height (from button detection). Proportions transcribed from the
 /// reference tech pack: notch at 0.14w, peak at 0.25w / 0.24h, break at
 /// 0.09w; dashed topstitching inset 9px; roll line from neck to button.
-pub fn lapel_template(vg: f32, vb: f32) -> Template {
+pub fn lapel_template(vg: f32, _vb: f32) -> Template {
     // Scale down: use compact vb (not detector's tall vb).
     // Target lapel is ~0.15h tall, not 0.32h.
     // Peak at 0.26 (further out than notch_outer 0.16) for the jut.
@@ -225,7 +225,7 @@ pub fn lapel_template(vg: f32, vb: f32) -> Template {
 
 /// Lapel template with explicit peak x position (for curvature-snapped placement).
 /// `peak_x` is the normalized x offset from center (0.30 = wide angular lapel).
-pub fn lapel_template_with_peak(vg: f32, vb: f32, peak_x: f32) -> Template {
+pub fn lapel_template_with_peak(vg: f32, _vb: f32, peak_x: f32) -> Template {
     // Notched lapel geometry (target-measured):
     // - Gorge: where collar meets lapel at center front
     // - Notch: V-shaped cutout between collar and lapel (the "step")
@@ -240,10 +240,12 @@ pub fn lapel_template_with_peak(vg: f32, vb: f32, peak_x: f32) -> Template {
     // Target shows a pronounced step, not a subtle one.
     // PEAK MUST BE FURTHER OUT than notch_outer to create the jut.
     let break_pt = (0.08f32, vg); // BREAK: collar ends here
-    let notch_outer = (0.16f32, vg + 0.003f32); // Step outward
+    let notch_outer = (0.16f32, vg + 0.015f32); // Step outward AND down (pronounced)
     let peak = (peak_x, vg + 0.030f32); // Peak FURTHER OUT (jut!)
-    let brk = (0.10f32, vb); // Meets front edge
-                             // (Old cubic curve rendered a rounded shield; removed per target.)
+                                        // brk: where lapel meets front edge. NOT at button (vb) — above it.
+                                        // Target lapel height ~0.35 (vg=0.08 to brk=0.43).
+    let brk = (0.10f32, vg + 0.35f32); // Meets front edge above button
+                                       // (Old cubic curve rendered a rounded shield; removed per target.)
     Template {
         name: "lapel",
         paths: vec![

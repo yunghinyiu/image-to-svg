@@ -168,6 +168,75 @@ impl CurvatureMap {
         }
         best
     }
+
+    /// Trace a ridge polyline starting from (x, y), following high curvature.
+    /// `dir` is the initial direction (dx, dy) normalized.
+    /// `max_steps` limits the trace length, `step` is pixels per step.
+    /// `min_strength` is the curvature threshold (0.0-1.0 normalized).
+    /// Returns the traced polyline (including start point).
+    pub fn trace_ridge(
+        &self,
+        x: f32,
+        y: f32,
+        dir: (f32, f32),
+        max_steps: usize,
+        step: f32,
+        min_strength: f32,
+    ) -> Vec<(f32, f32)> {
+        let max_c = self.curv.iter().cloned().fold(0.0f32, f32::max).max(1e-6);
+        let threshold = min_strength * max_c;
+
+        let mut points = vec![(x, y)];
+        let (mut px, mut py) = (x, y);
+        let (mut dx, mut dy) = dir;
+        // Normalize direction
+        let len = (dx * dx + dy * dy).sqrt().max(1e-6);
+        dx /= len;
+        dy /= len;
+
+        for _ in 0..max_steps {
+            // Look ahead in a cone: try directions within ±45° of current
+            let mut best = None;
+            let mut best_c = threshold;
+
+            // Sample 5 directions: -45°, -22.5°, 0°, +22.5°, +45°
+            for angle in [-0.785f32, -0.393f32, 0.0f32, 0.393f32, 0.785f32] {
+                let ca = angle.cos();
+                let sa = angle.sin();
+                let ndx = dx * ca - dy * sa;
+                let ndy = dx * sa + dy * ca;
+
+                let nx = px + ndx * step;
+                let ny = py + ndy * step;
+
+                if nx < 0.0 || ny < 0.0 || nx >= self.w as f32 || ny >= self.h as f32 {
+                    continue;
+                }
+
+                // Snap to local max within small radius
+                let (sx, sy) = self.snap_to_ridge(nx, ny, step * 0.8, min_strength);
+                let c = self.curv
+                    [(sy as usize).min(self.h - 1) * self.w + (sx as usize).min(self.w - 1)];
+
+                if c > best_c {
+                    best_c = c;
+                    best = Some((sx, sy, ndx, ndy));
+                }
+            }
+
+            match best {
+                Some((nx, ny, ndx, ndy)) => {
+                    points.push((nx, ny));
+                    px = nx;
+                    py = ny;
+                    dx = ndx;
+                    dy = ndy;
+                }
+                None => break, // No strong ridge ahead, stop
+            }
+        }
+        points
+    }
 }
 
 #[cfg(test)]
