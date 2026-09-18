@@ -14,7 +14,7 @@ You need Rust and Cargo installed.
 cargo run -p im2vec-cli -- input.png -o output.svg --preset logo
 ```
 
-Pick the preset that matches your image. Use logo for icons and flat marks, illustration for cartoons and flat art with more colors, photo for pictures with gradients and shadows, mono for black and white line art.
+Pick the preset that matches your image. Use logo for icons and flat marks, illustration for cartoons and flat art with more colors, photo for pictures with gradients and shadows, mono for black and white line art, flat for flat-lay clothing photos when you want a tech-pack style sketch draft.
 
 ## Web preview
 
@@ -25,4 +25,3 @@ cargo run -p im2vec-web
 ```
 
 Open http://127.0.0.1:5173, drop in an image, and it converts right away. Move the sliders to tune it, compare side by side, and download the SVG when you like it.
-

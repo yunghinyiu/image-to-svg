@@ -741,6 +741,7 @@ dependencies = [
  "anyhow",
  "clap",
  "im2vec-core",
+ "im2vec-flat",
 ]
 
 [[package]]
@@ -754,6 +755,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "im2vec-flat"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "im2vec-core",
+ "image",
+]
+
+[[package]]
 name = "im2vec-web"
 version = "0.1.0"
 dependencies = [
@@ -761,6 +771,7 @@ dependencies = [
  "axum",
  "base64",
  "im2vec-core",
+ "im2vec-flat",
  "serde",
  "serde_json",
  "tokio",
