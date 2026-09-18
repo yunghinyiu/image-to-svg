@@ -21,6 +21,7 @@ use serde::Serialize;
 use std::io::Cursor;
 use std::time::Instant;
 
+mod search;
 mod template;
 use template::{
     back_collar_template, gorge_seam_template, lapel_template, pocket_template, render_template,
@@ -496,7 +497,8 @@ fn convert_flat_rgb(rgb: &RgbImage, opts: &FlatOptions) -> Result<FlatOutput> {
     // Phase 6: parametric structural linework (lapels, collar, pockets).
     // Solid edges in <g id="structure">, dashed details get per-path dash.
     // Chains are passed for photo-driven template alignment (#20 refinement).
-    let (struct_solid, struct_dashed) = generate_structure(&buttons, &comps, &scaled);
+    let (struct_solid, struct_dashed) =
+        generate_structure(&buttons, &comps, &scaled, w as usize, h as usize);
     if !struct_solid.is_empty() || !struct_dashed.is_empty() {
         svg.push_str("<g id=\"structure\" fill=\"none\" stroke=\"#1a1a1a\" stroke-width=\"2\" stroke-linecap=\"round\" stroke-linejoin=\"round\">");
         for p in &struct_solid {
@@ -2162,7 +2164,9 @@ fn push_rendered(
 fn generate_structure(
     buttons: &[Button],
     comps: &[Component],
-    _chains: &[Vec<(f32, f32)>],
+    chains: &[Vec<(f32, f32)>],
+    img_w: usize,
+    img_h: usize,
 ) -> StructurePaths {
     let mut solid = Vec::new();
     let mut dashed = Vec::new();
@@ -2254,31 +2258,57 @@ fn generate_structure(
             h,
             mirror: false,
         };
-        let vg = (y_gorge - y0) / h;
+        let vg_default = (y_gorge - y0) / h;
         let vb = (y_button - y0) / h;
+
+        // #27: snap templates to photo edges. The edge map is built once
+        // from the photo's XDoG chains; each template searches a small
+        // candidate grid and keeps the default unless a candidate aligns
+        // clearly better (confidence-gated, so weak edges can't regress).
+        let edges = search::EdgeMap::from_chains(chains, img_w, img_h);
+        let (vg, lapel_w) = search::search_lapel(vg_default, vb, &frame, &edges);
+        if std::env::var("IM2VEC_FLAT_DEBUG").is_ok() {
+            eprintln!("[structure] lapel vg {vg_default:.3}->{vg:.3}, w {w:.0}->{lapel_w:.0}");
+        }
 
         // Lapels: canonical right-side template, mirrored for the left.
         // Path order per side is preserved (outer edge, curve, stitching,
         // roll line). Note: mirroring makes the left lapel curve a true
         // mirror of the right; the pre-#28 code had a latent asymmetry
         // (`side * (brk.0 - peak.0)` double-applied the side, bowing the
-        // left curve outward). See PR discussion.
+        // left curve outward). See PR #30 discussion.
+        let lapel_frame = Placement {
+            w: lapel_w,
+            ..frame
+        };
         let lapel = lapel_template(vg, vb);
         for mirror in [true, false] {
-            let side_frame = Placement { mirror, ..frame };
+            let side_frame = Placement {
+                mirror,
+                ..lapel_frame
+            };
             push_rendered(&mut solid, &mut dashed, &lapel, &side_frame);
             // Gorge seam is drawn once, after the left (mirrored) side,
             // matching the original loop's `if side < 0.0` placement.
             if mirror {
-                push_rendered(&mut solid, &mut dashed, &gorge_seam_template(vg), &frame);
+                push_rendered(
+                    &mut solid,
+                    &mut dashed,
+                    &gorge_seam_template(vg),
+                    &lapel_frame,
+                );
             }
         }
 
         // Pocket flaps (mirrored): rounded rect + dashed topstitching.
         // #20 refinement: align pocket Y to bottom button row.
         let pocket_y_default = y0 + 0.73 * h;
-        let pocket_y = refine_pocket_y(buttons, x0, y0, x1, y1, pocket_y_default);
+        let pocket_y_refined = refine_pocket_y(buttons, x0, y0, x1, y1, pocket_y_default);
         let pocket = pocket_template(w, h);
+        let pocket_y = search::search_pocket_y(pocket_y_refined, &pocket, cx, w, h, &edges);
+        if std::env::var("IM2VEC_FLAT_DEBUG").is_ok() {
+            eprintln!("[structure] pocket_y {pocket_y_refined:.1}->{pocket_y:.1}");
+        }
         for side in [-1.0f32, 1.0] {
             let pocket_frame = Placement {
                 ax: cx + side * 0.25 * w,
@@ -3268,7 +3298,7 @@ mod tests {
                 cy: 566.0,
             },
         ];
-        let (solid, dashed) = generate_structure(&buttons, &comps, &[]);
+        let (solid, dashed) = generate_structure(&buttons, &comps, &[], 1600, 900);
         // Front: 2 lapel edges + 2 roll lines + 1 gorge + 2 notch ticks (in edge)
         //        + 2 pockets = ~9 solid; back: collar (4) = 4 solid.
         // Dashed: 2 lapel stitch + 2 pocket stitch + 1 collar stitch + 1 back seam.
@@ -3305,7 +3335,7 @@ mod tests {
                 symmetrized: true,
             },
         ];
-        let (solid, dashed) = generate_structure(&[], &comps, &[]);
+        let (solid, dashed) = generate_structure(&[], &comps, &[], 1600, 900);
         assert!(solid.is_empty() && dashed.is_empty());
     }
 }
