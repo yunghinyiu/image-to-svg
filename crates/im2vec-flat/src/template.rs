@@ -216,6 +216,12 @@ fn rounded_rect_uv(
 /// reference tech pack: notch at 0.14w, peak at 0.25w / 0.24h, break at
 /// 0.09w; dashed topstitching inset 9px; roll line from neck to button.
 pub fn lapel_template(vg: f32, vb: f32) -> Template {
+    lapel_template_with_peak(vg, vb, 0.30f32)
+}
+
+/// Lapel template with explicit peak x position (for curvature-snapped placement).
+/// `peak_x` is the normalized x offset from center (0.30 = wide angular lapel).
+pub fn lapel_template_with_peak(vg: f32, vb: f32, peak_x: f32) -> Template {
     // #33: peak placed relative to the notch (vg), not at a fixed v.
     // Photo-measured (blazer): peak sits ~0.05w outboard and ~0.03h below the
     // notch; the old fixed (0.25, 0.24) put it ~50px too low and too far out,
@@ -223,14 +229,11 @@ pub fn lapel_template(vg: f32, vb: f32) -> Template {
     // Target-measured: peak is WIDE at 0.30w outboard (not 0.19w) for the
     // broad angular lapel; notch at 0.14w where collar meets lapel.
     let notch = (0.14f32, vg);
-    let peak = (0.30f32, vg + 0.020f32);
+    let peak = (peak_x, vg + 0.020f32);
     let brk = (0.12f32, vb);
-    // Peak -> break gentle curve, cubic control points (transcribed).
-    let c1 = (peak.0, peak.1 + (brk.1 - peak.1) * 0.35);
-    let c2 = (
-        peak.0 + (brk.0 - peak.0) * 0.3,
-        brk.1 - (brk.1 - peak.1) * 0.25,
-    );
+    // Peak -> break: STRAIGHT line for sharp angular peak lapel.
+    // The target shows a crisp triangle, not a rounded shield.
+    // (Old cubic curve rendered a rounded shield; removed per target.)
     // Roll line: the V from neck to button. Target shows it nearly vertical,
     // ending at the top button.
     let roll = vec![
@@ -249,27 +252,20 @@ pub fn lapel_template(vg: f32, vb: f32) -> Template {
             ]),
             // Outer edge: peak -> break (curve). Sharp corner at the peak
             // for the notch-lapel point.
-            TPath::solid(sample_cubic_uv(peak, c1, c2, brk, 16)),
+            // Outer edge: peak -> break (STRAIGHT for sharp angular lapel).
+            TPath::solid(vec![
+                TPoint::Norm(peak.0, peak.1),
+                TPoint::Norm(brk.0, brk.1),
+            ]),
             // Dashed topstitching parallel to the outer edge, inset 9px.
             TPath::dashed(vec![
                 TPoint::NormPx(notch.0, notch.1, -9.0, 2.0),
                 TPoint::NormPx(peak.0, peak.1, -9.0, 0.0),
             ]),
-            TPath::dashed(
-                sample_cubic_uv(
-                    (peak.0, peak.1),
-                    (c1.0, c1.1),
-                    (c2.0, c2.1),
-                    (brk.0, brk.1),
-                    16,
-                )
-                .into_iter()
-                .map(|tp| match tp {
-                    TPoint::Norm(u, v) => TPoint::NormPx(u, v, -9.0, 0.0),
-                    other => other,
-                })
-                .collect(),
-            ),
+            TPath::dashed(vec![
+                TPoint::NormPx(peak.0, peak.1, -9.0, 0.0),
+                TPoint::NormPx(brk.0, brk.1, -9.0, 0.0),
+            ]),
             // Roll line.
             TPath::solid(roll),
         ],
@@ -534,9 +530,9 @@ mod tests {
         let t = lapel_template(0.09, 0.4);
         assert_eq!(t.paths.len(), 5);
         assert_eq!(t.paths.iter().filter(|p| p.dashed).count(), 2);
-        // Curve paths are sampled into 17 points (16 segments).
-        assert_eq!(t.paths[1].points.len(), 17);
-        assert_eq!(t.paths[3].points.len(), 17);
+        // Angular lapel: straight lines have 2 points each (not sampled curves).
+        assert_eq!(t.paths[1].points.len(), 2);
+        assert_eq!(t.paths[3].points.len(), 2);
     }
 
     #[test]
