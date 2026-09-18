@@ -72,9 +72,6 @@ struct Args {
     /// flat preset only: also mirror the detail linework (off: logos/pockets stay put)
     #[arg(long, default_value_t = false, default_missing_value = "true", num_args(0..=1))]
     symmetrize_lines: bool,
-    /// flat preset only: render details as dashed stitch strokes (solid = seam)
-    #[arg(long, default_value_t = false, default_missing_value = "true", num_args(0..=1))]
-    stitch_dashes: bool,
     /// flat preset only: silhouette outline stroke width in px
     #[arg(long, default_value_t = 2.0)]
     outline_width: f32,
@@ -95,7 +92,6 @@ fn main() -> Result<()> {
             input: im2vec_flat::FlatInput::parse(&args.flat_input),
             symmetrize: args.symmetrize,
             symmetrize_lines: args.symmetrize_lines,
-            stitch_dashed: args.stitch_dashes,
             outline_width: args.outline_width,
             detail_strength: args.detail_strength,
             speckle: args.filter_speckle,

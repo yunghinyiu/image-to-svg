@@ -48,9 +48,6 @@ pub struct FlatOptions {
     /// Mirror the detail linework too. Off by default: asymmetric details
     /// (chest logos, pockets) must stay where they are, not be duplicated.
     pub symmetrize_lines: bool,
-    /// Render inner details as dashed stitch strokes (factory convention:
-    /// solid = seam, dashed = stitching). Off = solid uniform strokes.
-    pub stitch_dashed: bool,
     /// Outline stroke width in px on the silhouette path.
     pub outline_width: f32,
     /// 0..=1. Higher keeps weaker lines (fabric folds); lower keeps only
@@ -66,7 +63,6 @@ impl Default for FlatOptions {
             input: FlatInput::FlatLay,
             symmetrize: true,
             symmetrize_lines: false,
-            stitch_dashed: false,
             outline_width: 2.0,
             detail_strength: 0.6,
             speckle: 4,
@@ -274,28 +270,74 @@ fn convert_flat_rgb(rgb: &RgbImage, opts: &FlatOptions) -> Result<FlatOutput> {
         svg.push_str(p);
     }
     svg.push_str("</g>");
-    svg.push_str(&format!(
-        "<g id=\"details\" fill=\"none\" stroke=\"#1a1a1a\" stroke-width=\"2\" stroke-linecap=\"round\" stroke-linejoin=\"round\"{}>",
-        if opts.stitch_dashed {
-            " stroke-dasharray=\"7 4\""
-        } else {
-            ""
-        }
-    ));
+    // Phase 3: per-group linework. Chains are classified (Seam/Fold/Noise);
+    // seams render solid, folds render only at high detail_strength,
+    // noise is dropped. Procedural stitching (dashed) is generated separately.
     let (sxx, syy) = (w as f32 / xd.sw as f32, h as f32 / xd.sh as f32);
-    let mut n_det = 0;
-    for c in &xd.chains {
-        if c.len() < 2 {
-            continue;
+    // Scale chains to output coords for classification (thresholds are in px).
+    let scaled: Vec<Vec<(f32, f32)>> = xd
+        .chains
+        .iter()
+        .filter(|c| c.len() >= 2)
+        .map(|c| c.iter().map(|&(px, py)| (px * sxx, py * syy)).collect())
+        .collect();
+    let keep_folds = opts.detail_strength > 0.8;
+    // Edge band for stitch detection: pixels within 30px of silhouette boundary.
+    // Short chains here are photo topstitching; elsewhere they're texture.
+    let eroded = erode(&mask, w, h, 30);
+    let edge_band: Vec<bool> = mask
+        .iter()
+        .zip(eroded.iter())
+        .map(|(&m, &e)| m && !e)
+        .collect();
+    let mut seams: Vec<&Vec<(f32, f32)>> = Vec::new();
+    let mut folds: Vec<&Vec<(f32, f32)>> = Vec::new();
+    let mut stitches: Vec<Vec<(f32, f32)>> = Vec::new();
+    let mut n_noise = 0;
+    for c in &scaled {
+        match classify_chain(c, &edge_band, rgb, w as usize, h as usize) {
+            ChainKind::Seam => seams.push(c),
+            ChainKind::Stitch => {
+                // Aggressive smoothing for clean dashed lines.
+                stitches.push(simplify_dp(c, 3.0));
+            }
+            ChainKind::Fold => {
+                if keep_folds {
+                    folds.push(c);
+                }
+            }
+            ChainKind::Noise => n_noise += 1,
         }
+    }
+    if std::env::var("IM2VEC_FLAT_DEBUG").is_ok() {
+        eprintln!(
+            "chain classifier: {} seam, {} stitch, {} fold (kept={}), {} noise dropped",
+            seams.len(),
+            stitches.len(),
+            folds.len(),
+            keep_folds,
+            n_noise
+        );
+    }
+    svg.push_str("<g id=\"seams\" fill=\"none\" stroke=\"#1a1a1a\" stroke-width=\"2\" stroke-linecap=\"round\" stroke-linejoin=\"round\">");
+    let mut n_det = 0;
+    for c in seams.iter().chain(folds.iter()) {
         n_det += 1;
-        svg.push_str(&format!(
-            "<path d=\"M{:.1},{:.1}",
-            c[0].0 * sxx,
-            c[0].1 * syy
-        ));
+        svg.push_str(&format!("<path d=\"M{:.1},{:.1}", c[0].0, c[0].1));
         for &(px, py) in &c[1..] {
-            svg.push_str(&format!("L{:.1},{:.1}", px * sxx, py * syy));
+            svg.push_str(&format!("L{:.1},{:.1}", px, py));
+        }
+        svg.push_str("\"/>");
+    }
+    svg.push_str("</g>");
+    // Procedural topstitching (dashed) — generated hems/cuffs + smoothed photo stitching.
+    let stitch_paths = generate_stitching(&mask, &comps, w as usize, h as usize);
+    svg.push_str("<g id=\"stitching\" fill=\"none\" stroke=\"#1a1a1a\" stroke-width=\"1.5\" stroke-linecap=\"round\" stroke-linejoin=\"round\" stroke-dasharray=\"7 4\">");
+    for p in stitch_paths.iter().chain(stitches.iter()) {
+        n_det += 1;
+        svg.push_str(&format!("<path d=\"M{:.1},{:.1}", p[0].0, p[0].1));
+        for &(px, py) in &p[1..] {
+            svg.push_str(&format!("L{:.1},{:.1}", px, py));
         }
         svg.push_str("\"/>");
     }
@@ -1462,6 +1504,168 @@ fn arc_len(c: &[(f32, f32)]) -> f32 {
         .sum()
 }
 
+/// Semantic label for a detail chain (Phase 3: linework semantics).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ChainKind {
+    /// Long, low-curvature structural line (princess seam, center seam,
+    /// hem edge). Rendered solid.
+    Seam,
+    /// Short chain near the silhouette edge: photo's topstitching.
+    /// Smoothed aggressively and rendered dashed (procedural-style).
+    Stitch,
+    /// Medium length or curvy: wrinkles, folds, pocket flaps, collar bits.
+    /// Dropped by default; kept only at high detail_strength.
+    Fold,
+    /// Short specks: denim texture, skeleton fragments. Always dropped.
+    Noise,
+}
+
+/// Chord / arc ratio: 1.0 = perfectly straight.
+fn straightness(c: &[(f32, f32)]) -> f32 {
+    if c.len() < 2 {
+        return 0.0;
+    }
+    let (ax, ay) = c[0];
+    let (bx, by) = c[c.len() - 1];
+    let chord = ((bx - ax).powi(2) + (by - ay).powi(2)).sqrt();
+    let arc = arc_len(c);
+    if arc > 0.0 {
+        (chord / arc).min(1.0)
+    } else {
+        0.0
+    }
+}
+
+/// Classify a chain in output-pixel coords (after sxx/syy scaling).
+/// Thresholds from blazer chain stats: 173/203 paths < 100px (texture),
+/// ~30 long/straight (seams).
+/// `edge_band`: mask of pixels within STITCH_EDGE_DIST of the silhouette
+/// boundary (precomputed).
+/// `rgb`: source image for brightness check (white stitching vs blue denim).
+/// Short bright chains near edges or linear are photo topstitching (Stitch);
+/// short dark/medium chains are texture (Noise).
+fn classify_chain(
+    c: &[(f32, f32)],
+    edge_band: &[bool],
+    rgb: &RgbImage,
+    w: usize,
+    h: usize,
+) -> ChainKind {
+    let len = arc_len(c);
+    if len > 90.0 && straightness(c) > 0.85 {
+        return ChainKind::Seam;
+    }
+    if len < 25.0 {
+        // Sample brightness: white stitching (L>130) vs blue denim (L~110-120).
+        // Note: chains sit on stitch edges, so sample is mixed; threshold low.
+        let mut bright = 0;
+        let mut total = 0;
+        for &(px, py) in c.iter().step_by(2) {
+            let xi = (px as usize).min(w - 1);
+            let yi = (py as usize).min(h - 1);
+            let p = rgb.get_pixel(xi as u32, yi as u32);
+            let lum = 0.299 * p[0] as f32 + 0.587 * p[1] as f32 + 0.114 * p[2] as f32;
+            total += 1;
+            if lum > 130.0 {
+                bright += 1;
+            }
+        }
+        let is_bright = total > 0 && bright * 2 >= total;
+        // Near-edge short chains = photo topstitching (hem/cuff/front edge).
+        let near = c
+            .iter()
+            .filter(|&&(px, py)| {
+                let xi = px as usize;
+                let yi = py as usize;
+                xi < w && yi < h && edge_band[yi * w + xi]
+            })
+            .count();
+        let near_edge = near * 2 >= c.len();
+        // Bright + (near edge OR linear) = stitching; else texture.
+        if is_bright && (near_edge || straightness(c) > 0.7) {
+            return ChainKind::Stitch;
+        }
+        return ChainKind::Noise;
+    }
+    ChainKind::Fold
+}
+
+/// Generate procedural topstitching (dashed) as inward offsets of the
+/// silhouette's bottom edges (hems + cuffs). For each view component,
+/// trace the bottom boundary, take the longest contiguous run, offset
+/// upward by INSET, and simplify. Returns polylines in output coords.
+fn generate_stitching(
+    mask: &[bool],
+    comps: &[Component],
+    w: usize,
+    _h: usize,
+) -> Vec<Vec<(f32, f32)>> {
+    const INSET: f32 = 8.0; // px inward from the edge
+    const MAX_JUMP: usize = 12; // max vertical discontinuity within a run
+    let mut out = Vec::new();
+    for comp in comps.iter().skip(1) {
+        if comp.x1 <= comp.x0 || comp.y1 <= comp.y0 {
+            continue;
+        }
+        let width = (comp.x1 - comp.x0) as f32;
+        // Min length scales with component size (cuffs are narrower than hems).
+        let min_len = (width * 0.15).max(25.0);
+        // Bottom boundary: for each x, the lowest foreground y.
+        // Keep ALL runs longer than min_len (hem + cuffs), not just the longest.
+        let mut cur: Vec<(f32, f32)> = Vec::new();
+        let mut prev_y: Option<usize> = None;
+        for x in comp.x0..comp.x1 {
+            let mut by: Option<usize> = None;
+            let y_lo = comp.y1.saturating_sub(((comp.y1 - comp.y0) / 7).max(20));
+            for y in (y_lo..comp.y1).rev() {
+                if mask[y * w + x] {
+                    by = Some(y);
+                    break;
+                }
+            }
+            let continuous = match (by, prev_y) {
+                (Some(y), Some(py)) => y.abs_diff(py) <= MAX_JUMP,
+                (Some(_), None) => true,
+                _ => false,
+            };
+            if continuous {
+                if let Some(y) = by {
+                    cur.push((x as f32, y as f32));
+                }
+            } else {
+                if arc_len(&cur) >= min_len {
+                    out.push(simplify_dp(&offset_up(cur, INSET), 1.5));
+                }
+                cur = Vec::new();
+                if let Some(y) = by {
+                    cur.push((x as f32, y as f32));
+                }
+            }
+            prev_y = by;
+        }
+        if arc_len(&cur) >= min_len {
+            out.push(simplify_dp(&offset_up(cur, INSET), 1.5));
+        }
+        if std::env::var("IM2VEC_FLAT_DEBUG").is_ok() {
+            eprintln!(
+                "stitching: comp ({},{})-({},{}) min_len={:.1}, total paths={}",
+                comp.x0,
+                comp.y0,
+                comp.x1,
+                comp.y1,
+                min_len,
+                out.len()
+            );
+        }
+    }
+    out.into_iter().filter(|p| p.len() >= 2).collect()
+}
+
+/// Offset a bottom-edge polyline upward (inward) by `d` px.
+fn offset_up(pts: Vec<(f32, f32)>, d: f32) -> Vec<(f32, f32)> {
+    pts.into_iter().map(|(x, y)| (x, y - d)).collect()
+}
+
 /// Douglas-Peucker simplification (recursive; chains are short).
 fn simplify_dp(pts: &[(f32, f32)], tol: f32) -> Vec<(f32, f32)> {
     if pts.len() <= 2 {
@@ -1955,25 +2159,19 @@ mod tests {
             out.svg.contains("id=\"silhouette\""),
             "has silhouette group"
         );
-        assert!(out.svg.contains("id=\"details\""), "has details group");
+        assert!(out.svg.contains("id=\"seams\""), "has seams group");
+        assert!(out.svg.contains("id=\"stitching\""), "has stitching group");
         assert!(out.svg.contains("stroke-width"), "silhouette is stroked");
         assert!(
             out.svg.contains("fill=\"none\""),
             "details are stroked polylines"
         );
-        assert!(!out.svg.contains("stroke-dasharray"), "solid by default");
-        // Dashed mode emits the stitch convention.
-        let out_d = convert_flat_bytes(
-            &png,
-            &FlatOptions {
-                stitch_dashed: true,
-                ..Default::default()
-            },
-        )
-        .unwrap();
+        // Phase 3: per-group linework — seams solid, stitching dashed.
+        assert!(out.svg.contains("id=\"seams\""), "has seams group");
+        assert!(out.svg.contains("id=\"stitching\""), "has stitching group");
         assert!(
-            out_d.svg.contains("stroke-dasharray=\"7 4\""),
-            "dashed stitches"
+            out.svg.contains("stroke-dasharray=\"7 4\""),
+            "stitching is dashed"
         );
         assert!(
             out.path_count >= 2,
