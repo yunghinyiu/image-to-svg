@@ -294,10 +294,28 @@ fn convert_flat_rgb(rgb: &RgbImage, opts: &FlatOptions) -> Result<FlatOutput> {
     let mut folds: Vec<&Vec<(f32, f32)>> = Vec::new();
     let mut stitches: Vec<Vec<(f32, f32)>> = Vec::new();
     let mut n_noise = 0;
-    // Per-chain heuristic labels, parallel to `scaled` (for the Jev prototype dump).
+    // Optional experiment override: IM2VEC_LABELS_JSON points at a flat JSON
+    // object {"<chain_id>": "seam"|"stitch"|"fold"|"noise"} (e.g. Jev decisions)
+    // that replaces the heuristic classifier for this run.
+    let label_override = load_label_override();
+    // Per-chain labels, parallel to `scaled` (for the Jev prototype dump).
     let mut labels: Vec<&str> = Vec::with_capacity(scaled.len());
-    for c in &scaled {
-        let kind = classify_chain(c, &edge_band, rgb, w as usize, h as usize);
+    for (idx, c) in scaled.iter().enumerate() {
+        let kind = match label_override
+            .as_ref()
+            .and_then(|m| m.get(&idx))
+            .map(|s| s.as_str())
+        {
+            Some("seam") => ChainKind::Seam,
+            Some("stitch") => ChainKind::Stitch,
+            Some("fold") => ChainKind::Fold,
+            Some("noise") => ChainKind::Noise,
+            Some(other) => {
+                eprintln!("IM2VEC_LABELS_JSON: unknown label '{other}' for chain {idx}, using heuristic");
+                classify_chain(c, &edge_band, rgb, w as usize, h as usize)
+            }
+            None => classify_chain(c, &edge_band, rgb, w as usize, h as usize),
+        };
         labels.push(match kind {
             ChainKind::Seam => "seam",
             ChainKind::Stitch => "stitch",
@@ -1646,6 +1664,26 @@ fn classify_chain(
         return ChainKind::Noise;
     }
     ChainKind::Fold
+}
+
+/// Prototype-only: load a per-chain label override from
+/// `IM2VEC_LABELS_JSON`, a flat JSON object like `{"0":"seam","1":"noise"}`.
+/// Hand-rolled parser (no new deps); returns None when unset/unreadable.
+fn load_label_override() -> Option<std::collections::HashMap<usize, String>> {
+    let path = std::env::var("IM2VEC_LABELS_JSON").ok()?;
+    let text = std::fs::read_to_string(&path).ok()?;
+    let mut map = std::collections::HashMap::new();
+    for pair in text.trim().trim_matches(|c| c == '{' || c == '}').split(',') {
+        let mut kv = pair.splitn(2, ':');
+        let (k, v) = (kv.next()?.trim(), kv.next()?.trim());
+        let id: usize = k.trim_matches('"').parse().ok()?;
+        map.insert(id, v.trim_matches('"').to_string());
+    }
+    if map.is_empty() {
+        eprintln!("IM2VEC_LABELS_JSON: no labels parsed from {path}");
+        return None;
+    }
+    Some(map)
 }
 
 /// Debug/ML-prototype dump: one JSON object per chain with the features the
