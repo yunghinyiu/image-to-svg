@@ -14,7 +14,10 @@
 
 use anyhow::{bail, Context, Result};
 use im2vec_core::{convert_image, ColorImage, ConvertOptions, ImPreset};
-use image::{GrayImage, RgbImage};
+use image::{GrayImage, ImageFormat, RgbImage};
+use serde::Serialize;
+use std::io::Cursor;
+use std::time::Instant;
 
 /// Max image side in px; larger inputs are downscaled for speed.
 const MAX_SIDE: u32 = 1600;
@@ -61,6 +64,12 @@ impl Default for FlatOptions {
     }
 }
 
+#[derive(Debug, Clone, Serialize)]
+pub struct FlatStage {
+    pub name: String,
+    pub elapsed_ms: u128,
+}
+
 #[derive(Debug, Clone)]
 pub struct FlatOutput {
     pub svg: String,
@@ -68,6 +77,18 @@ pub struct FlatOutput {
     pub height: u32,
     pub path_count: usize,
     pub svg_bytes: usize,
+    /// Per-stage timings, in execution order (drives the web UI sidebar).
+    pub stages: Vec<FlatStage>,
+    /// Downscaled PNGs of the garment mask and XDoG linework (None on encode failure).
+    pub mask_preview_png: Option<Vec<u8>>,
+    pub lines_preview_png: Option<Vec<u8>>,
+}
+
+fn stage(stages: &mut Vec<FlatStage>, name: &str, t: Instant) {
+    stages.push(FlatStage {
+        name: name.into(),
+        elapsed_ms: t.elapsed().as_millis(),
+    });
 }
 
 pub fn convert_flat_bytes(bytes: &[u8], opts: &FlatOptions) -> Result<FlatOutput> {
@@ -95,19 +116,24 @@ pub fn convert_flat_bytes(bytes: &[u8], opts: &FlatOptions) -> Result<FlatOutput
 fn convert_flat_rgb(rgb: &RgbImage, opts: &FlatOptions) -> Result<FlatOutput> {
     let (w, h) = (rgb.width(), rgb.height());
     let lum = luminance(rgb);
+    let mut stages: Vec<FlatStage> = Vec::new();
 
     // 1. foreground mask via backdrop keying.
+    let t = Instant::now();
     let mut mask = foreground_mask(&lum, w, h);
     if opts.symmetrize {
         symmetrize_mask(&mut mask, w, h);
     }
+    stage(&mut stages, "background keying", t);
     if !mask.iter().any(|&b| b) {
         bail!("no garment found — flat mode needs a plain, bright backdrop behind the garment");
     }
 
     // 2. silhouette pass: black garment on white.
+    let t = Instant::now();
     let sil_img = mask_to_color(&mask, w, h);
     let sil = convert_image(&sil_img, w, h, &trace_opts(opts.speckle))?;
+    stage(&mut stages, "trace silhouette", t);
     let sil_paths = extract_paths(&sil.svg);
     if sil_paths.is_empty() {
         bail!("silhouette trace produced no paths");
@@ -122,6 +148,7 @@ fn convert_flat_rgb(rgb: &RgbImage, opts: &FlatOptions) -> Result<FlatOutput> {
         .collect();
 
     // 3. detail pass: XDoG lines inside (slightly dilated) garment region.
+    let t = Instant::now();
     let region = dilate(&mask, w, h, 2);
     let mut lines = xdog_lines(&lum, w, h, opts.detail_strength);
     for (i, v) in lines.iter_mut().enumerate() {
@@ -132,8 +159,11 @@ fn convert_flat_rgb(rgb: &RgbImage, opts: &FlatOptions) -> Result<FlatOutput> {
     if opts.symmetrize {
         symmetrize_gray_max(&mut lines, w, h);
     }
+    stage(&mut stages, "XDoG linework", t);
+    let t = Instant::now();
     let det_img = gray_to_color(&lines, w, h);
     let det = convert_image(&det_img, w, h, &trace_opts(opts.speckle))?;
+    stage(&mut stages, "trace details", t);
     let det_paths = extract_paths(&det.svg);
 
     // 4. compose one flat-style SVG.
@@ -171,6 +201,9 @@ fn convert_flat_rgb(rgb: &RgbImage, opts: &FlatOptions) -> Result<FlatOutput> {
         svg,
         width: w,
         height: h,
+        stages,
+        mask_preview_png: png_thumb_mask(&mask, w, h),
+        lines_preview_png: png_thumb_gray(&lines, w, h),
     })
 }
 
@@ -432,6 +465,28 @@ fn gray_to_color(g: &[u8], w: u32, h: u32) -> ColorImage {
         width: w as usize,
         height: h as usize,
     }
+}
+
+/// Downscaled PNG for the UI sidebar (None if encoding fails).
+fn png_thumb_gray(g: &[u8], w: u32, h: u32) -> Option<Vec<u8>> {
+    let full = GrayImage::from_raw(w, h, g.to_vec())?;
+    let thumb = image::imageops::thumbnail(&full, 480, 480);
+    let mut buf = Vec::new();
+    image::DynamicImage::ImageLuma8(thumb)
+        .write_to(&mut Cursor::new(&mut buf), ImageFormat::Png)
+        .ok()?;
+    Some(buf)
+}
+
+fn png_thumb_mask(mask: &[bool], w: u32, h: u32) -> Option<Vec<u8>> {
+    png_thumb_gray(
+        &mask
+            .iter()
+            .map(|&b| if b { 255u8 } else { 0 })
+            .collect::<Vec<_>>(),
+        w,
+        h,
+    )
 }
 
 #[cfg(test)]
