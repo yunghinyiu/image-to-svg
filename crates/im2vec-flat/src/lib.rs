@@ -21,6 +21,7 @@ use serde::Serialize;
 use std::io::Cursor;
 use std::time::Instant;
 
+mod detect;
 mod search;
 mod template;
 use template::{
@@ -2258,7 +2259,13 @@ fn generate_structure(
             h,
             mirror: false,
         };
-        let vg_default = (y_gorge - y0) / h;
+        // #29: detection proposes, #27 search refines. Each detector is
+        // confidence-gated; below threshold the heuristic stands.
+        let lapel_pair = detect::detect_lapel_pair(chains, cx, w, y0, h);
+        let gorge_proposal = detect::detect_gorge_y(chains, cx, w, y_gorge)
+            .filter(|&(_, conf)| conf >= detect::DETECT_CONFIDENCE_MIN);
+        let y_gorge_final = gorge_proposal.map(|(y, _)| y).unwrap_or(y_gorge);
+        let vg_default = (y_gorge_final - y0) / h;
         let vb = (y_button - y0) / h;
 
         // #27: snap templates to photo edges. The edge map is built once
@@ -2269,6 +2276,20 @@ fn generate_structure(
         let (vg, lapel_w) = search::search_lapel(vg_default, vb, &frame, &edges);
         if std::env::var("IM2VEC_FLAT_DEBUG").is_ok() {
             eprintln!("[structure] lapel vg {vg_default:.3}->{vg:.3}, w {w:.0}->{lapel_w:.0}");
+            match (&gorge_proposal, &lapel_pair) {
+                (Some((gy, gc)), Some(lp)) => eprintln!(
+                    "[detect] gorge y={gy:.1} (conf {gc:.2}), lapel pair {}/{} (conf {:.2})",
+                    lp.left_idx, lp.right_idx, lp.confidence
+                ),
+                (Some((gy, gc)), None) => {
+                    eprintln!("[detect] gorge y={gy:.1} (conf {gc:.2}), no lapel pair")
+                }
+                (None, Some(lp)) => eprintln!(
+                    "[detect] gorge heuristic, lapel pair {}/{} (conf {:.2})",
+                    lp.left_idx, lp.right_idx, lp.confidence
+                ),
+                (None, None) => eprintln!("[detect] gorge heuristic, no lapel pair"),
+            }
         }
 
         // Lapels: canonical right-side template, mirrored for the left.
@@ -2304,10 +2325,19 @@ fn generate_structure(
         // #20 refinement: align pocket Y to bottom button row.
         let pocket_y_default = y0 + 0.73 * h;
         let pocket_y_refined = refine_pocket_y(buttons, x0, y0, x1, y1, pocket_y_default);
+        // #29: pocket detector proposes the flap y; #27 search refines it.
+        let pocket_proposal = detect::detect_pocket_y(chains, cx, w, pocket_y_refined)
+            .filter(|&(_, conf)| conf >= detect::DETECT_CONFIDENCE_MIN);
+        let pocket_center = pocket_proposal.map(|(y, _)| y).unwrap_or(pocket_y_refined);
         let pocket = pocket_template(w, h);
-        let pocket_y = search::search_pocket_y(pocket_y_refined, &pocket, cx, w, h, &edges);
+        let pocket_y = search::search_pocket_y(pocket_center, &pocket, cx, w, h, &edges);
         if std::env::var("IM2VEC_FLAT_DEBUG").is_ok() {
-            eprintln!("[structure] pocket_y {pocket_y_refined:.1}->{pocket_y:.1}");
+            match pocket_proposal {
+                Some((py, pc)) => eprintln!(
+                    "[detect] pocket y={py:.1} (conf {pc:.2}), search {pocket_center:.1}->{pocket_y:.1}"
+                ),
+                None => eprintln!("[detect] pocket heuristic, search {pocket_center:.1}->{pocket_y:.1}"),
+            }
         }
         for side in [-1.0f32, 1.0] {
             let pocket_frame = Placement {
