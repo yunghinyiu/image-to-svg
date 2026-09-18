@@ -9,7 +9,10 @@
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
-use vtracer::{Clustering, ColorImage, Config, FitMode, Hierarchical, Preset};
+use vtracer::{Clustering, Config, FitMode, Hierarchical, Preset};
+
+/// Re-exported so sibling crates (e.g. `im2vec-flat`) can feed pixels in.
+pub use vtracer::ColorImage;
 
 /// High-level preset tuned for our roadmap: logos -> illustration -> photo.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]

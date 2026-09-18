@@ -6,7 +6,6 @@ edition = "2021"
 [dependencies]
 im2vec-core = { path = "../im2vec-core" }
 im2vec-flat = { path = "../im2vec-flat" }
-im2vec-eval = { path = "../im2vec-eval" }
 anyhow = "1"
 axum = { version = "0.7", features = ["multipart"] }
 tokio = { version = "1", features = ["full"] }
