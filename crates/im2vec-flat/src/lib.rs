@@ -241,6 +241,17 @@ fn convert_flat_rgb(rgb: &RgbImage, opts: &FlatOptions) -> Result<FlatOutput> {
     // Uniform symbol radius (reference proportions), scaled to output width.
     let button_r = 9.4 * w as f32 / 1536.0;
     separate_buttons(&mut buttons, 2.0 * (button_r + 1.0) + 2.0);
+    // #35: snap front buttons to a fitted 2x3 grid (artist-regular).
+    // Front = largest component (skip background comps[0]).
+    if let Some(front) = comps.iter().skip(1).max_by_key(|c| c.area) {
+        snap_front_buttons_to_grid(
+            &mut buttons,
+            front.x0 as f32,
+            front.x1 as f32,
+            front.y0 as f32,
+            front.y1 as f32,
+        );
+    }
     stage(&mut stages, "button detection", t);
 
     // #19: Apply artist proportion compensation to the silhouette mask.
@@ -1521,6 +1532,49 @@ fn separate_buttons(buttons: &mut [Button], min_dist: f32) {
         }
         if !moved {
             break;
+        }
+    }
+}
+
+/// #35: snap the 6 front buttons to a fitted 2x3 grid. A tech-pack artist
+/// draws front buttons on a perfect grid; photo detections carry a few px of
+/// jitter (and our columns were converging). Least-squares fit the grid from
+/// the detections, then replace positions with the grid points — still traced
+/// from the photo, just regularized.
+fn snap_front_buttons_to_grid(buttons: &mut [Button], x0: f32, x1: f32, y0: f32, y1: f32) {
+    // Front buttons: inside the front component bbox, 6 expected (2 cols x 3 rows).
+    let mut idx: Vec<usize> = buttons
+        .iter()
+        .enumerate()
+        .filter(|(_, b)| b.cx >= x0 && b.cx <= x1 && b.cy >= y0 && b.cy <= y1)
+        .map(|(i, _)| i)
+        .collect();
+    if idx.len() != 6 {
+        return;
+    }
+    // Sort into 3 rows by y, then 2 columns by x within each row.
+    idx.sort_by(|&a, &b| buttons[a].cy.partial_cmp(&buttons[b].cy).unwrap());
+    let mut rows: Vec<[usize; 2]> = Vec::new();
+    for r in 0..3 {
+        let mut pair = [idx[r * 2], idx[r * 2 + 1]];
+        if buttons[pair[0]].cx > buttons[pair[1]].cx {
+            pair.swap(0, 1);
+        }
+        rows.push(pair);
+    }
+    // Grid lines: column x = mean of column, row y = mean of row.
+    let col_x = [
+        rows.iter().map(|r| buttons[r[0]].cx).sum::<f32>() / 3.0,
+        rows.iter().map(|r| buttons[r[1]].cx).sum::<f32>() / 3.0,
+    ];
+    let row_y: Vec<f32> = rows
+        .iter()
+        .map(|r| (buttons[r[0]].cy + buttons[r[1]].cy) / 2.0)
+        .collect();
+    for (r, row) in rows.iter().enumerate() {
+        for (c, &bi) in row.iter().enumerate() {
+            buttons[bi].cx = col_x[c];
+            buttons[bi].cy = row_y[r];
         }
     }
 }
