@@ -499,8 +499,8 @@ fn symmetrize_components(
         let rel_growth = if hem_buffer / (h as f32) < 0.30 {
             // Growth scales from 5% at the edge to BASE_MAX_GROWTH at the 30% threshold.
             let t = hem_buffer / (h as f32); // 0.0 at edge, 0.3 at threshold
-            let growth = 0.05 + (BASE_MAX_GROWTH - 0.05) * (t / 0.30);
-            growth
+
+            0.05 + (BASE_MAX_GROWTH - 0.05) * (t / 0.30)
         } else {
             BASE_MAX_GROWTH
         };
