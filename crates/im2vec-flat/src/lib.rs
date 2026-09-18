@@ -106,6 +106,15 @@ pub fn convert_flat_bytes(bytes: &[u8], opts: &FlatOptions) -> Result<FlatOutput
         bail!("on-model photos need the Phase-2 ML segmenter (segformer clothes, ONNX) which is not bundled yet — use flat-lay / ghost-mannequin photos for now");
     }
     let t0 = Instant::now();
+    let rgb = decode_downscaled(bytes)?;
+    if std::env::var("IM2VEC_FLAT_DEBUG").is_ok() {
+        eprintln!("decode+resize: {} ms", t0.elapsed().as_millis());
+    }
+    convert_flat_rgb(&rgb, opts)
+}
+
+/// Decode + downscale to [`MAX_SIDE`] (shared by the pipeline and the eval harness).
+fn decode_downscaled(bytes: &[u8]) -> Result<RgbImage> {
     let img = image::load_from_memory(bytes).context("decode image (png/jpg/webp/...)")?;
     let mut rgb = img.to_rgb8();
     if rgb.width().max(rgb.height()) > MAX_SIDE {
@@ -118,30 +127,57 @@ pub fn convert_flat_bytes(bytes: &[u8], opts: &FlatOptions) -> Result<FlatOutput
         // at 5MP; this is O(n) with better reduction quality than Nearest.
         rgb = downscale_area(&rgb, nw.max(1), nh.max(1));
     }
-    if std::env::var("IM2VEC_FLAT_DEBUG").is_ok() {
-        eprintln!("decode+resize: {} ms", t0.elapsed().as_millis());
-    }
-    convert_flat_rgb(&rgb, opts)
+    Ok(rgb)
 }
 
-fn convert_flat_rgb(rgb: &RgbImage, opts: &FlatOptions) -> Result<FlatOutput> {
+/// Backdrop-keyed garment mask + labeled components, the shared first stage
+/// of the flat pipeline. Pure function of the input; extracting it changes
+/// nothing about pipeline output.
+fn mask_and_components(
+    rgb: &RgbImage,
+    symmetrize: bool,
+) -> Result<(Vec<bool>, Vec<u32>, Vec<Component>)> {
     let (w, h) = (rgb.width(), rgb.height());
     let lum = luminance(rgb);
-    let mut stages: Vec<FlatStage> = Vec::new();
-
-    // 1. foreground mask via backdrop keying.
-    let t = Instant::now();
     let mut mask = smooth_mask(&foreground_mask(&lum, w, h), w, h, 2);
     let (labels, mut comps) = label_components(&mask, w as usize, h as usize);
-    if opts.symmetrize {
+    if symmetrize {
         // Per-view: no cross-view contamination, no re-label needed (the
         // mirror pass never steals pixels from a neighbouring view).
         symmetrize_components(&mut mask, &labels, &mut comps, w as usize, h as usize);
     }
-    stage(&mut stages, "background keying", t);
     if !mask.iter().any(|&b| b) {
         bail!("no garment found — flat mode needs a plain, bright backdrop behind the garment");
     }
+    Ok((mask, labels, comps))
+}
+
+/// Full-resolution garment mask (white = garment) for the eval harness.
+/// Runs the same backdrop-keying + symmetrization as [`convert_flat_bytes`];
+/// additive measurement API, does not change pipeline output.
+pub fn flat_garment_mask(png_bytes: &[u8], opts: &FlatOptions) -> Result<GrayImage> {
+    if opts.input == FlatInput::OnModel {
+        bail!("on-model photos need the Phase-2 ML segmenter (segformer clothes, ONNX) which is not bundled yet — use flat-lay / ghost-mannequin photos for now");
+    }
+    let rgb = decode_downscaled(png_bytes)?;
+    let (w, h) = (rgb.width(), rgb.height());
+    let (mask, _, _) = mask_and_components(&rgb, opts.symmetrize)?;
+    GrayImage::from_raw(
+        w,
+        h,
+        mask.iter().map(|&b| if b { 255u8 } else { 0 }).collect(),
+    )
+    .context("build mask image")
+}
+
+fn convert_flat_rgb(rgb: &RgbImage, opts: &FlatOptions) -> Result<FlatOutput> {
+    let (w, h) = (rgb.width(), rgb.height());
+    let mut stages: Vec<FlatStage> = Vec::new();
+
+    // 1. foreground mask via backdrop keying.
+    let t = Instant::now();
+    let (mask, _labels, comps) = mask_and_components(rgb, opts.symmetrize)?;
+    stage(&mut stages, "background keying", t);
 
     // 2. silhouette pass: black garment on white.
     let t = Instant::now();
