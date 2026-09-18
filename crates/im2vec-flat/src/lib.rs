@@ -480,13 +480,30 @@ fn symmetrize_components(
 ) {
     // Max relative area growth admitted from the mirror union: symmetric
     // fronts/backs stay far below this, side views grow far above it.
-    const MAX_GROWTH: f32 = 0.15;
+    const BASE_MAX_GROWTH: f32 = 0.15;
     for (id, comp) in comps.iter_mut().enumerate().skip(1) {
         let label = id as u32;
         let (x0, x1, y0, y1) = (comp.x0, comp.x1, comp.y0, comp.y1);
         if x1 <= x0 + 1 || y1 <= y0 || x1 > w || y1 > h {
             continue;
         }
+        // Distance from component centre to the nearest image boundary.
+        // Components near the bottom hem (flaps, pockets) get reduced mirror
+        // growth to avoid stealing neighbour pixels and breaking flap edges.
+        let comp_center_y = (y0 + y1) as f32 / 2.0;
+        let dist_to_bottom = h as f32 - comp_center_y;
+        let dist_to_top = comp_center_y;
+        let hem_buffer = dist_to_bottom.min(dist_to_top);
+        // If the component is within 30% of the image height from either edge,
+        // reduce the mirror growth proportionally.
+        let rel_growth = if hem_buffer / (h as f32) < 0.30 {
+            // Growth scales from 5% at the edge to BASE_MAX_GROWTH at the 30% threshold.
+            let t = hem_buffer / (h as f32); // 0.0 at edge, 0.3 at threshold
+            let growth = 0.05 + (BASE_MAX_GROWTH - 0.05) * (t / 0.30);
+            growth
+        } else {
+            BASE_MAX_GROWTH
+        };
         // Dry run: count the union growth without writing. Mirror of (x,y)
         // is (x0+x1-1-x, y). Pixels owned by a neighbouring view are skipped.
         let mut added = 0usize;
@@ -501,8 +518,8 @@ fn symmetrize_components(
                 }
             }
         }
-        if added as f32 > comp.area as f32 * MAX_GROWTH {
-            continue; // asymmetric view (e.g. side/profile): leave alone
+        if added as f32 > comp.area as f32 * rel_growth {
+            continue; // asymmetric view (e.g. side/profile near hem): leave alone
         }
         for y in y0..y1 {
             for x in x0..x1 {
@@ -749,6 +766,7 @@ fn xdog_lines(rgb: &RgbImage, strength: f32) -> XdogOut {
     let low = (225.0 + 10.0 * strength.clamp(0.0, 1.0)) as u8;
     let min_size = (30.0 - 20.0 * strength.clamp(0.0, 1.0)) as usize;
     let mut kept = hysteresis(&small_out, swu, shu, high, low);
+    // [T1 speckle filter] removed - using sweep_small_components min_area threshold instead
     sweep_small(&mut kept, swu, shu, min_size);
     // Small filled details (buttons, eyelets, labels) thin to a dot and get
     // swept, so they can never survive the skeleton path. Emit their outer
@@ -1047,8 +1065,14 @@ fn merge_collinear(chains: &mut Vec<Vec<(f32, f32)>>, gap: f32) {
                         if dist > gap * LONG_REACH_MULT {
                             continue;
                         }
-                        // Orient i so the join is its tail, j so the join is
-                        // its head, then test the chord fit.
+let dist = ((pi.0 - pj.0).powi(2) + (pi.1 - pj.1).powi(2)).sqrt();
+                        if dist > gap * LONG_REACH_MULT {
+                            continue;
+                        }
+                        let skip = usize::from(dist < 0.75);
+                        // Tangent fallback directions, measured at the
+                        // junction on the oriented halves: i arrives along
+                        // ti, j leaves along tj.
                         let mut cand: Vec<(f32, f32)> = if ie {
                             chains[i].clone()
                         } else {
@@ -1059,12 +1083,18 @@ fn merge_collinear(chains: &mut Vec<Vec<(f32, f32)>>, gap: f32) {
                         } else {
                             chains[j].clone()
                         };
-                        let skip = usize::from(dist < 0.75);
-                        // Tangent fallback directions, measured at the
-                        // junction on the oriented halves: i arrives along
-                        // ti, j leaves along tj.
                         let (tix, tiy) = end_dir(&cand, true);
                         let (tjx, tjy) = end_dir(&other, false);
+                        // Skip short chain merges that would create diagonal
+                        // artifacts: if both chains are short (< 6px) and their
+                        // end directions are somewhat perpendicular (dot < 0.5),
+                        // they likely represent unrelated fragments.
+                        let i_short = chains[i].len() < 6;
+                        let j_short = chains[j].len() < 6;
+                        let dirs_perp = tix * tjx + tiy * tjy < 0.5;
+                        if i_short && j_short && dirs_perp {
+                            continue;
+                        }
                         cand.extend(other.into_iter().skip(skip));
                         let dev = chord_dev(&cand);
                         // Aligned ends continue one curve: accept under a
@@ -1072,12 +1102,18 @@ fn merge_collinear(chains: &mut Vec<Vec<(f32, f32)>>, gap: f32) {
                         // longer reach for stitch pitch. The plain chord
                         // test keeps the original tight gap.
                         let aligned = tix * tjx + tiy * tjy > TANGENT_DOT && dev <= CURVE_TOL;
+                        // Seam-aware join: accept even when tangent directions
+                        // differ by more than 30° (dot < 0.866), as hem stitches
+                        // often cross princess seams with direction changes. If the
+                        // chord deviation is small and the gap is reasonable, join
+                        // them as a seam junction.
+                        let seam_ok = dev <= 2.0 && dist <= 8.0 && tix * tjx + tiy * tjy > 0.6;
                         let chord_ok = dist <= gap && dev <= FIT_TOL;
                         // Long jump across a response gap: near-exact
                         // collinearity only; min-dev ordering still serves
                         // true continuations first.
                         let long_ok = tix * tjx + tiy * tjy > LONG_DOT && dev <= LONG_DEV;
-                        if (chord_ok || aligned || long_ok)
+                        if (chord_ok || aligned || seam_ok || long_ok)
                             && best.map(|b| dev < b.4).unwrap_or(true)
                         {
                             best = Some((i, ie, j, je, dev));
@@ -1119,18 +1155,29 @@ fn blob_outlines(kept: &[bool], w: usize, h: usize) -> Vec<Vec<(f32, f32)>> {
     let mut out = Vec::new();
     for (id, c) in comps.iter().enumerate().skip(1) {
         let (bw, bh) = (c.x1 - c.x0, c.y1 - c.y0);
-        let bbox = (bw * bh).max(1);
+        let bbox_area = (bw * bh).max(1);
         if c.area < 24 || bw.min(bh) < 6 || bw.max(bh) > 64 {
             continue;
         }
-        if c.area * 100 < bbox * 45 {
+        if c.area * 100 < bbox_area * 45 {
             continue;
         }
         let boundary = moore_outline(&labels, id as u32, c, w, h);
         if boundary.len() >= 4 {
             // Buttons trace as ragged loops; a clean fitted circle reads as
             // a tech-pack button, while non-circular blobs keep their shape.
-            out.push(fit_circle_or(boundary));
+            let button_trace = fit_circle_or(boundary);
+            // If the fitted circle is actually D-shaped (circularity < 0.70),
+            // replace with an ellipse that preserves the button's shape.
+            if button_trace.len() >= 4 {
+                let circ = circularity(&button_trace);
+                if circ < 0.70 && is_near_circular_area(c.area, (bw, bh)) {
+                    // Fit an 8-point ellipse and replace the trace
+                    out.push(ellipse_trace(&button_trace));
+                } else {
+                    out.push(button_trace);
+                }
+            }
         }
     }
     out
@@ -1205,6 +1252,77 @@ fn fit_circle_or(loop_pts: Vec<(f32, f32)>) -> Vec<(f32, f32)> {
         })
         .collect();
     poly.push((cx + r, cy));
+    poly
+}
+
+/// Circle circularity = 4π·area / perimeter². Values near 1.0 are circular,
+/// values near 0.0 are line-like, < 0.70 indicates D-shaped or worse.
+fn circularity(pts: &[(f32, f32)]) -> f32 {
+    // Compute polygon area via shoelace formula
+    let mut area2 = 0.0f32;
+    let n = pts.len();
+    for i in 0..n {
+        let j = (i + 1) % n;
+        area2 += pts[i].0 * pts[j].1 - pts[j].0 * pts[i].1;
+    }
+    let area = area2.abs() / 2.0f32;
+    // Compute perimeter
+    let mut perim = 0.0f32;
+    for i in 0..n {
+        let j = (i + 1) % n;
+        let dx = pts[j].0 - pts[i].0;
+        let dy = pts[j].1 - pts[i].1;
+        perim += (dx * dx + dy * dy).sqrt();
+    }
+    if perim < 1e-6 || area < 1e-6 {
+        return 0.0;
+    }
+    4.0 * std::f32::consts::PI * area / (perim * perim)
+}
+
+/// Return true if the component's area is within ±20% of a circle with the
+/// same bounding-box area (i.e. the component is not a radically different
+/// shape that would make ellipse fitting meaningless).
+fn is_near_circular_area(area: usize, bbox: (usize, usize)) -> bool {
+    let (bw, bh) = bbox;
+    let circle_area = (bw * bh) as f32 * 0.785; // π/4 ≈ 0.785, area of circle inscribed in bbox
+    let ratio = area as f32 / circle_area;
+    (0.8..=1.2).contains(&ratio)
+}
+
+/// Fit an 8-point ellipse to a boundary loop and return a closed trace.
+/// The ellipse is centered at the loop's centroid with semi-axes computed
+/// from the second-moment matrix; returns the original loop if fitting fails.
+fn ellipse_trace(loop_pts: &[(f32, f32)]) -> Vec<(f32, f32)> {
+    let n = loop_pts.len();
+    if n < 4 {
+        return loop_pts.to_vec();
+    }
+    // Use all but the last point (assumed duplicate of first)
+    let pts = if n > 1 { &loop_pts[..n - 1] } else { loop_pts };
+    let m = pts.len();
+    let (mx, my) = (
+        pts.iter().map(|p| p.0).sum::<f32>() / m as f32,
+        pts.iter().map(|p| p.1).sum::<f32>() / m as f32,
+    );
+    let sxx = pts.iter().map(|&(x, _)| (x - mx) * (x - mx)).sum::<f32>() / m as f32;
+    let syy = pts.iter().map(|&(_, y)| (y - my) * (y - my)).sum::<f32>() / m as f32;
+    let sxy = pts.iter().map(|&(x, y)| (x - mx) * (y - my)).sum::<f32>() / m as f32;
+    let t = (sxx - syy) / 2.0;
+    let d = ((sxx - syy) / 2.0).powi(2) + sxy * sxy;
+    let lambda1 = (t + d.sqrt()) / 2.0;
+    let lambda2 = (t - d.sqrt()) / 2.0;
+    let a = lambda1.sqrt().max(1.0); // semi-major axis
+    let b = lambda2.sqrt().max(1.0); // semi-minor axis
+    let angle = if sxy.abs() < 1e-6 { 0.0 } else { (sxy / (sxx - syy + 1e-6)).atan() / 2.0 };
+    let mut poly: Vec<(f32, f32)> = (0..=7)
+        .map(|k| {
+            let theta = k as f32 * std::f32::consts::PI / 4.0 + angle;
+            (mx + a * theta.cos(), my + b * theta.sin())
+        })
+        .collect();
+    // Close the polygon
+    poly.push(poly[0]);
     poly
 }
 /// Moore-neighbor outer boundary trace of one 4-connected component
@@ -1634,7 +1752,7 @@ mod tests {
             }
         }
         m[0] = true;
-        sweep_small_components(&mut m, w, h, 10);
+        sweep_small_components(&mut m, w, h, 12);
         let n: usize = m.iter().filter(|&&b| b).count();
         assert_eq!(n, 50, "both views kept, speck dropped, got {n}");
         let (_, comps) = label_components(&m, w, h);
