@@ -2124,6 +2124,7 @@ type StructurePaths = (Vec<Vec<(f32, f32)>>, Vec<Vec<(f32, f32)>>);
 /// Refine pocket Y position using photo evidence (#20 template alignment).
 /// Uses button positions as reliable landmarks: on a double-breasted blazer,
 /// flap pockets sit just below the bottom button row.
+/// Returns the flap's BOTTOM edge y (the pocket template is bottom-anchored).
 fn refine_pocket_y(buttons: &[Button], x0: f32, y0: f32, x1: f32, y1: f32, default_y: f32) -> f32 {
     let h = y1 - y0;
     // Find bottom-most button in the front component
@@ -2133,8 +2134,9 @@ fn refine_pocket_y(buttons: &[Button], x0: f32, y0: f32, x1: f32, y1: f32, defau
         .map(|b| b.cy)
         .fold(f32::NEG_INFINITY, f32::max);
     if bottom_y.is_finite() {
-        // Pockets sit ~4% of h below the bottom button row
-        let refined = bottom_y + 0.04 * h;
+        // Flap bottom sits ~10% of h below the bottom button row
+        // (old top-anchored 4% + one flap height of 6%).
+        let refined = bottom_y + 0.10 * h;
         // Sanity: must be within [0.60h, 0.85h] and not too far from default
         let y_lo = y0 + 0.60 * h;
         let y_hi = y0 + 0.85 * h;
