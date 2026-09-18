@@ -21,15 +21,6 @@ use serde::Serialize;
 use std::io::Cursor;
 use std::time::Instant;
 
-mod detect;
-mod search;
-pub mod shading;
-mod template;
-use template::{
-    back_collar_template, front_collar_template, gorge_seam_template, lapel_template_with_peak,
-    pocket_template, render_template, Placement, Template,
-};
-
 /// Max image side in px; larger inputs are downscaled for speed.
 const MAX_SIDE: u32 = 1600;
 
@@ -190,15 +181,6 @@ fn aniso_scale_mask(mask: &[bool], w: usize, h: usize, sx: f32, sy: f32) -> Vec<
     out
 }
 
-/// #38: map a photo-coordinate point into the compensated output frame —
-/// the point-wise form of the same transform [`aniso_scale_mask`] applies to
-/// the silhouette bitmap and the button emission applies to buttons. Keeps
-/// silhouette, structure, detail, and buttons in one consistent frame.
-fn compensate_point(x: f32, y: f32, w: f32, h: f32, sx: f32, sy: f32) -> (f32, f32) {
-    let (cx, cy) = (w / 2.0, h / 2.0);
-    ((x - cx) * sx + cx, (y - cy) * sy + cy)
-}
-
 /// Full-resolution garment mask (white = garment) for the eval harness.
 /// Runs the same backdrop-keying + symmetrization as [`convert_flat_bytes`];
 /// additive measurement API, does not change pipeline output.
@@ -242,36 +224,10 @@ fn convert_flat_rgb(rgb: &RgbImage, opts: &FlatOptions) -> Result<FlatOutput> {
     // Uniform symbol radius (reference proportions), scaled to output width.
     let button_r = 9.4 * w as f32 / 1536.0;
     separate_buttons(&mut buttons, 2.0 * (button_r + 1.0) + 2.0);
-    // #35: snap front buttons to a fitted 2x3 grid (artist-regular).
-    // Front = largest component (skip background comps[0]).
-    if let Some(front) = comps.iter().skip(1).max_by_key(|c| c.area) {
-        snap_front_buttons_to_grid(
-            &mut buttons,
-            front.x0 as f32,
-            front.x1 as f32,
-            front.y0 as f32,
-            front.y1 as f32,
-        );
-    }
-    stage(&mut stages, "button snap", t);
-
-    // Shape-from-shading: estimate surface normals and curvature for
-    // 3D-structure-aware template placement. The curvature map reveals
-    // true fold lines (lapel roll, armhole seams) that 2D edge detection
-    // misses. Templates snap to these ridges instead of fixed fractions.
-    let t = Instant::now();
-    let gray = image::imageops::grayscale(rgb);
-    let (cw, ch) = (gray.width() as usize, gray.height() as usize);
-    let normals = shading::estimate_normals(&gray);
-    let curv = shading::curvature_from_normals(&normals, cw, ch);
-    let curvature_map = shading::CurvatureMap::new(curv, cw, ch);
-    stage(&mut stages, "shape-from-shading", t);
     stage(&mut stages, "button detection", t);
 
-    // #19: Apply artist proportion compensation to the silhouette mask.
-    // #38: the SAME transform is applied to structure/detail/button geometry
-    // in Rust below, so the whole drawing lives in one consistent frame
-    // (previously structure stayed in photo coords — internally inconsistent).
+    // #19: Apply artist proportion compensation AFTER button detection.
+    // The scaled mask is used for the silhouette path and eval IoU.
     let (sx, sy) = opts.proportion_compensation;
     let mask = if (sx - 1.0).abs() > 1e-6 || (sy - 1.0).abs() > 1e-6 {
         aniso_scale_mask(&mask_unscaled, w as usize, h as usize, sx, sy)
@@ -433,6 +389,10 @@ fn convert_flat_rgb(rgb: &RgbImage, opts: &FlatOptions) -> Result<FlatOutput> {
     let label_override = load_label_override();
     // Per-chain labels, parallel to `scaled` (for the Jev prototype dump).
     let mut labels: Vec<&str> = Vec::with_capacity(scaled.len());
+    // #20: Button positions as structural anchors for short-seam filtering.
+    // Buttons are in photo coordinates (unscaled); chains are also in photo
+    // coordinates at this stage (scaling happens later for the silhouette).
+    let button_pts: Vec<(f32, f32)> = buttons.iter().map(|b| (b.cx, b.cy)).collect();
     for (idx, c) in scaled.iter().enumerate() {
         let kind = match label_override
             .as_ref()
@@ -447,9 +407,9 @@ fn convert_flat_rgb(rgb: &RgbImage, opts: &FlatOptions) -> Result<FlatOutput> {
                 eprintln!(
                     "IM2VEC_LABELS_JSON: unknown label '{other}' for chain {idx}, using heuristic"
                 );
-                classify_chain(c, &edge_band, rgb, w as usize, h as usize)
+                classify_chain(c, &edge_band, rgb, w as usize, h as usize, &button_pts)
             }
-            None => classify_chain(c, &edge_band, rgb, w as usize, h as usize),
+            None => classify_chain(c, &edge_band, rgb, w as usize, h as usize, &button_pts),
         };
         labels.push(match kind {
             ChainKind::Seam => "seam",
@@ -487,10 +447,6 @@ fn convert_flat_rgb(rgb: &RgbImage, opts: &FlatOptions) -> Result<FlatOutput> {
             n_noise
         );
     }
-    // #38: detail + structure geometry is traced in photo coords; map it into
-    // the compensated output frame (same transform as silhouette/buttons).
-    let (dsx, dsy) = opts.proportion_compensation;
-    let dpt = |x: f32, y: f32| compensate_point(x, y, w as f32, h as f32, dsx, dsy);
     svg.push_str("<g id=\"seams\" fill=\"none\" stroke=\"#1a1a1a\" stroke-width=\"2\" stroke-linecap=\"round\" stroke-linejoin=\"round\">");
     let mut n_det = 0;
     // Phase 5: suppress doubled seam lines before emitting.
@@ -505,21 +461,17 @@ fn convert_flat_rgb(rgb: &RgbImage, opts: &FlatOptions) -> Result<FlatOutput> {
         // Phase 5: light DP smoothing — the photo-traced chains carry
         // sub-pixel skeleton jitter; the reference draws smooth lines.
         let sc = simplify_dp(c, 2.0);
-        let (mx, my) = dpt(sc[0].0, sc[0].1);
-        svg.push_str(&format!("<path d=\"M{mx:.1},{my:.1}"));
+        svg.push_str(&format!("<path d=\"M{:.1},{:.1}", sc[0].0, sc[0].1));
         for &(px, py) in &sc[1..] {
-            let (lx, ly) = dpt(px, py);
-            svg.push_str(&format!("L{lx:.1},{ly:.1}"));
+            svg.push_str(&format!("L{:.1},{:.1}", px, py));
         }
         svg.push_str("\"/>");
     }
     for c in folds.iter() {
         n_det += 1;
-        let (mx, my) = dpt(c[0].0, c[0].1);
-        svg.push_str(&format!("<path d=\"M{mx:.1},{my:.1}"));
+        svg.push_str(&format!("<path d=\"M{:.1},{:.1}", c[0].0, c[0].1));
         for &(px, py) in &c[1..] {
-            let (lx, ly) = dpt(px, py);
-            svg.push_str(&format!("L{lx:.1},{ly:.1}"));
+            svg.push_str(&format!("L{:.1},{:.1}", px, py));
         }
         svg.push_str("\"/>");
     }
@@ -532,50 +484,13 @@ fn convert_flat_rgb(rgb: &RgbImage, opts: &FlatOptions) -> Result<FlatOutput> {
     svg.push_str("<g id=\"stitching\" fill=\"none\" stroke=\"#1a1a1a\" stroke-width=\"1.5\" stroke-linecap=\"round\" stroke-linejoin=\"round\" stroke-dasharray=\"7 4\">");
     for p in stitch_paths.iter().chain(stitches.iter()) {
         n_det += 1;
-        let (mx, my) = dpt(p[0].0, p[0].1);
-        svg.push_str(&format!("<path d=\"M{mx:.1},{my:.1}"));
+        svg.push_str(&format!("<path d=\"M{:.1},{:.1}", p[0].0, p[0].1));
         for &(px, py) in &p[1..] {
-            let (lx, ly) = dpt(px, py);
-            svg.push_str(&format!("L{lx:.1},{ly:.1}"));
+            svg.push_str(&format!("L{:.1},{:.1}", px, py));
         }
         svg.push_str("\"/>");
     }
     svg.push_str("</g>");
-    // Phase 6: parametric structural linework (lapels, collar, pockets).
-    // Solid edges in <g id="structure">, dashed details get per-path dash.
-    // Chains are passed for photo-driven template alignment (#20 refinement).
-    let (struct_solid, struct_dashed) = generate_structure(
-        &buttons,
-        &comps,
-        &scaled,
-        w as usize,
-        h as usize,
-        &mask,
-        &curvature_map,
-    );
-    if !struct_solid.is_empty() || !struct_dashed.is_empty() {
-        svg.push_str("<g id=\"structure\" fill=\"none\" stroke=\"#1a1a1a\" stroke-width=\"2\" stroke-linecap=\"round\" stroke-linejoin=\"round\">");
-        for p in &struct_solid {
-            let (mx, my) = dpt(p[0].0, p[0].1);
-            svg.push_str(&format!("<path d=\"M{mx:.1},{my:.1}"));
-            for &(px, py) in &p[1..] {
-                let (lx, ly) = dpt(px, py);
-                svg.push_str(&format!("L{lx:.1},{ly:.1}"));
-            }
-            svg.push_str("\"/>");
-        }
-        for p in &struct_dashed {
-            let (mx, my) = dpt(p[0].0, p[0].1);
-            svg.push_str(&format!("<path d=\"M{mx:.1},{my:.1}"));
-            for &(px, py) in &p[1..] {
-                let (lx, ly) = dpt(px, py);
-                svg.push_str(&format!("L{lx:.1},{ly:.1}"));
-            }
-            svg.push_str("\" stroke-dasharray=\"7 4\"/>");
-        }
-        svg.push_str("</g>");
-        n_det += struct_solid.len() + struct_dashed.len();
-    }
     // Phase 4: standardized button symbols. One symbol in <defs> (outer
     // ring + 4-hole dots, reference proportions: ring r = 9.4px at 1536px
     // wide, holes at +/-0.21r, hole r = 0.13r, all detached so the ring
@@ -600,8 +515,8 @@ fn convert_flat_rgb(rgb: &RgbImage, opts: &FlatOptions) -> Result<FlatOutput> {
             -hd, -hd, hd, -hd, -hd, hd, hd, hd,
         ));
         svg.push_str("<g id=\"buttons\">");
-        // #19/#38: button positions get the same proportion compensation as
-        // the silhouette and structure, keeping one consistent frame.
+        // #19: Scale button positions by the proportion compensation,
+        // matching the scaled silhouette.
         let (psx, psy) = opts.proportion_compensation;
         let (bcx, bcy) = (w as f32 / 2.0, h as f32 / 2.0);
         for b in &buttons {
@@ -1557,49 +1472,6 @@ fn separate_buttons(buttons: &mut [Button], min_dist: f32) {
     }
 }
 
-/// #35: snap the 6 front buttons to a fitted 2x3 grid. A tech-pack artist
-/// draws front buttons on a perfect grid; photo detections carry a few px of
-/// jitter (and our columns were converging). Least-squares fit the grid from
-/// the detections, then replace positions with the grid points — still traced
-/// from the photo, just regularized.
-fn snap_front_buttons_to_grid(buttons: &mut [Button], x0: f32, x1: f32, y0: f32, y1: f32) {
-    // Front buttons: inside the front component bbox, 6 expected (2 cols x 3 rows).
-    let mut idx: Vec<usize> = buttons
-        .iter()
-        .enumerate()
-        .filter(|(_, b)| b.cx >= x0 && b.cx <= x1 && b.cy >= y0 && b.cy <= y1)
-        .map(|(i, _)| i)
-        .collect();
-    if idx.len() != 6 {
-        return;
-    }
-    // Sort into 3 rows by y, then 2 columns by x within each row.
-    idx.sort_by(|&a, &b| buttons[a].cy.partial_cmp(&buttons[b].cy).unwrap());
-    let mut rows: Vec<[usize; 2]> = Vec::new();
-    for r in 0..3 {
-        let mut pair = [idx[r * 2], idx[r * 2 + 1]];
-        if buttons[pair[0]].cx > buttons[pair[1]].cx {
-            pair.swap(0, 1);
-        }
-        rows.push(pair);
-    }
-    // Grid lines: column x = mean of column, row y = mean of row.
-    let col_x = [
-        rows.iter().map(|r| buttons[r[0]].cx).sum::<f32>() / 3.0,
-        rows.iter().map(|r| buttons[r[1]].cx).sum::<f32>() / 3.0,
-    ];
-    let row_y: Vec<f32> = rows
-        .iter()
-        .map(|r| (buttons[r[0]].cy + buttons[r[1]].cy) / 2.0)
-        .collect();
-    for (r, row) in rows.iter().enumerate() {
-        for (c, &bi) in row.iter().enumerate() {
-            buttons[bi].cx = col_x[c];
-            buttons[bi].cy = row_y[r];
-        }
-    }
-}
-
 /// Detect buttons in the photo: gold-chroma round blobs inside the garment
 /// mask. Gold buttons read R-B strongly positive while denim reads strongly
 /// negative, so a single chroma gate separates them; roundness/size gates
@@ -2076,28 +1948,26 @@ fn classify_chain(
     rgb: &RgbImage,
     w: usize,
     h: usize,
+    buttons: &[(f32, f32)],
 ) -> ChainKind {
     let len = arc_len(c);
     let straight = straightness(c);
     let (_, bright_frac) = chain_brightness(c, rgb, w, h);
     let edge_frac = chain_edge_frac(c, edge_band, w, h);
-    // Seam: long + straight structural lines only (#20 retuning).
-    // Phase 6 templates now provide lapels/pockets/collar; the chain
-    // classifier is retuned for recall of LONG structure only. The
-    // medium-seam exception (45px) is removed — those fragments are
-    // now covered by templates or are spurious.
-    if len > 90.0 && straight > 0.85 {
+    // Seam: long + straight structural lines, or medium + very straight +
+    // dark near-miss seams (front edges, plackets).
+    let mut kind = if (len > 90.0 && straight > 0.85)
+        || (len > 45.0 && straight > 0.95 && bright_frac < 0.35)
+    {
         ChainKind::Seam
     } else if len < 25.0 {
         // Sample brightness: white stitching (L>130) vs blue denim (L~110-120).
         // Note: chains sit on stitch edges, so sample is mixed; threshold low.
         let is_bright = bright_frac >= 0.5;
         // Near-edge short chains = photo topstitching (hem/cuff/front edge).
-        // #20: Require near-edge (drop the straightness OR) — interior
-        // bright fragments are noise, not stitching. Phase 6 + procedural
-        // stitching cover the true topstitching.
         let near_edge = edge_frac >= 0.5;
-        if is_bright && near_edge {
+        // Bright + (near edge OR linear) = stitching; else texture.
+        if is_bright && (near_edge || straight > 0.7) {
             ChainKind::Stitch
         } else {
             ChainKind::Noise
@@ -2107,7 +1977,32 @@ fn classify_chain(
         ChainKind::Stitch
     } else {
         ChainKind::Fold
+    };
+
+    // #20: Demote short seams far from structural anchors.
+    // Short chains (<60px) classified as Seam are often wrinkle/shadow
+    // artifacts. Require them to be near a button (structural anchor);
+    // otherwise demote to Noise. This improves precision without hurting
+    // recall of long structural lines.
+    if kind == ChainKind::Seam && len < 60.0 && !buttons.is_empty() {
+        let (cx, cy) = {
+            let n = c.len() as f32;
+            let (sx, sy) = c
+                .iter()
+                .fold((0.0, 0.0), |(ax, ay), (x, y)| (ax + x, ay + y));
+            (sx / n, sy / n)
+        };
+        let near_button = buttons.iter().any(|(bx, by)| {
+            let dx = cx - bx;
+            let dy = cy - by;
+            dx * dx + dy * dy < 100.0 * 100.0
+        });
+        if !near_button {
+            kind = ChainKind::Noise;
+        }
     }
+
+    kind
 }
 
 /// Prototype-only: load a per-chain label override from
@@ -2179,305 +2074,6 @@ fn dump_chain_features(
     if let Err(e) = std::fs::write(path, out) {
         eprintln!("IM2VEC_DUMP_CHAINS: failed to write {path}: {e}");
     }
-}
-
-/// Phase 6: parametric structural linework (lapels, collar, pockets).
-/// The chain classifier can only keep/discard photo-traced chains; it cannot
-/// invent a lapel. This generates artist-plausible structure from landmarks:
-/// front buttons (center front + closure point) and view bounding boxes.
-///
-/// Returns (solid_paths, dashed_paths): lapel/collar edges are solid 2px,
-/// pocket topstitching and back-seam details are dashed.
-type StructurePaths = (Vec<Vec<(f32, f32)>>, Vec<Vec<(f32, f32)>>);
-
-/// Refine pocket Y position using photo evidence (#20 template alignment).
-/// Uses button positions as reliable landmarks: on a double-breasted blazer,
-/// flap pockets sit just below the bottom button row.
-/// Returns the flap's BOTTOM edge y (the pocket template is bottom-anchored).
-fn refine_pocket_y(buttons: &[Button], x0: f32, y0: f32, x1: f32, y1: f32, default_y: f32) -> f32 {
-    let h = y1 - y0;
-    // Find bottom-most button in the front component
-    let bottom_y = buttons
-        .iter()
-        .filter(|b| b.cx >= x0 && b.cx <= x1 && b.cy >= y0 && b.cy <= y1)
-        .map(|b| b.cy)
-        .fold(f32::NEG_INFINITY, f32::max);
-    if bottom_y.is_finite() {
-        // Flap bottom sits ~10% of h below the bottom button row
-        // (old top-anchored 4% + one flap height of 6%).
-        let refined = bottom_y + 0.10 * h;
-        // Sanity: must be within [0.60h, 0.85h] and not too far from default
-        let y_lo = y0 + 0.60 * h;
-        let y_hi = y0 + 0.85 * h;
-        if refined >= y_lo && refined <= y_hi && (refined - default_y).abs() < 0.10 * h {
-            return refined;
-        }
-    }
-    default_y
-}
-
-/// Render a [`Template`] through a [`Placement`] and append the resulting
-/// paths to the solid / dashed accumulators, preserving template path order.
-fn push_rendered(
-    solid: &mut Vec<Vec<(f32, f32)>>,
-    dashed: &mut Vec<Vec<(f32, f32)>>,
-    t: &Template,
-    p: &Placement,
-) {
-    for rp in render_template(t, p) {
-        if rp.dashed {
-            dashed.push(rp.points);
-        } else {
-            solid.push(rp.points);
-        }
-    }
-}
-
-fn generate_structure(
-    buttons: &[Button],
-    comps: &[Component],
-    chains: &[Vec<(f32, f32)>],
-    img_w: usize,
-    img_h: usize,
-    mask: &[bool],
-    _curvature_map: &shading::CurvatureMap,
-) -> StructurePaths {
-    let mut solid = Vec::new();
-    let mut dashed = Vec::new();
-
-    // Identify views: front = component with the most buttons (the 2-column
-    // front closure); back = the other large component; sleeve = narrow.
-    let mut front_idx: Option<usize> = None;
-    let mut back_idx: Option<usize> = None;
-    let mut best_count = 0;
-    for (i, comp) in comps.iter().enumerate().skip(1) {
-        let w = comp.x1.saturating_sub(comp.x0) as f32;
-        let h = comp.y1.saturating_sub(comp.y0) as f32;
-        if w < 50.0 || h < 100.0 {
-            continue;
-        }
-        let n = buttons
-            .iter()
-            .filter(|b| {
-                b.cx >= comp.x0 as f32
-                    && b.cx <= comp.x1 as f32
-                    && b.cy >= comp.y0 as f32
-                    && b.cy <= comp.y1 as f32
-            })
-            .count();
-        if n > best_count {
-            best_count = n;
-            front_idx = Some(i);
-        }
-    }
-    // Back = largest remaining component with aspect like front (not a sleeve).
-    if let Some(fi) = front_idx {
-        let fw = comps[fi].x1.saturating_sub(comps[fi].x0) as f32;
-        let mut best_area = 0usize;
-        for (i, comp) in comps.iter().enumerate().skip(1) {
-            if i == fi {
-                continue;
-            }
-            let w = comp.x1.saturating_sub(comp.x0) as f32;
-            if w < fw * 0.6 {
-                continue; // sleeve/detail view
-            }
-            if comp.area > best_area {
-                best_area = comp.area;
-                back_idx = Some(i);
-            }
-        }
-    }
-
-    // Front view: lapels, collar, pockets — via #28 Template/Placement.
-    // Landmarks stay here; template shapes live in template.rs and render
-    // through discrete Placements. Everything positional is photo-driven:
-    // button columns give the closure line, the detectors propose landmark
-    // rows from XDoG chains, and #27 search refines. No target-measured
-    // constants — positioning must trace the photo so a new garment gets
-    // the same treatment.
-    if let Some(fi) = front_idx {
-        let c = &comps[fi];
-        let (x0, y0, x1, y1) = (c.x0 as f32, c.y0 as f32, c.x1 as f32, c.y1 as f32);
-        let w = x1 - x0;
-        let h = y1 - y0;
-        let view = detect::ViewContext::new(x0, y0, x1, y1);
-        // Closure line from button columns (garment-agnostic: 1 column is a
-        // shirt-style placket, 2 columns a double-breasted front). Bail when
-        // the closure is ambiguous or absent — closure-relative templates
-        // must not render without closure evidence.
-        let front_pts: Vec<(f32, f32)> = buttons
-            .iter()
-            .filter(|b| b.cx >= x0 && b.cx <= x1 && b.cy >= y0 && b.cy <= y1)
-            .map(|b| (b.cx, b.cy))
-            .collect();
-        let cx = match detect::closure_center(&detect::detect_button_columns(&front_pts, &view)) {
-            Some(cx) => cx,
-            None => return (solid, dashed),
-        };
-        // Top button row y (min y of front buttons).
-        let y_button = buttons
-            .iter()
-            .filter(|b| b.cx >= x0 && b.cx <= x1 && b.cy >= y0 && b.cy <= y1)
-            .map(|b| b.cy)
-            .fold(f32::INFINITY, f32::min);
-
-        // Landmarks as fractions of frame height (proportions measured from
-        // the reference tech pack; #20 refinements anchor to buttons).
-        let y_gorge_default = y0 + 0.09 * h;
-        let y_gorge = if y_button.is_finite() {
-            let refined = y_button - 0.03 * h;
-            let y_lo = y0 + 0.05 * h;
-            let y_hi = y0 + 0.13 * h;
-            if refined >= y_lo && refined <= y_hi && (refined - y_gorge_default).abs() < 0.05 * h {
-                refined
-            } else {
-                y_gorge_default
-            }
-        } else {
-            y_gorge_default
-        };
-        let frame = Placement {
-            ax: cx,
-            ay: y0,
-            w,
-            h,
-            mirror: false,
-        };
-        // #29: detection proposes, #27 search refines. Each detector is
-        // confidence-gated; below threshold the heuristic stands.
-        let lapel_pair = detect::detect_lapel_pair(chains, cx, w, y0, h);
-        let gorge_proposal = detect::detect_gorge_y(chains, cx, w, y_gorge)
-            .filter(|&(_, conf)| conf >= detect::DETECT_CONFIDENCE_MIN);
-        let y_gorge_final = gorge_proposal.map(|(y, _)| y).unwrap_or(y_gorge);
-        let vg_default = (y_gorge_final - y0) / h;
-        let vb = (y_button - y0) / h;
-
-        // #27: snap templates to photo edges. The edge map is built once
-        // from the photo's XDoG chains; each template searches a small
-        // candidate grid and keeps the default unless a candidate aligns
-        // clearly better (confidence-gated, so weak edges can't regress).
-        let edges = search::EdgeMap::from_chains(chains, img_w, img_h);
-        let (vg, lapel_w) = search::search_lapel(vg_default, vb, &frame, &edges);
-        if std::env::var("IM2VEC_FLAT_DEBUG").is_ok() {
-            eprintln!("[structure] lapel vg {vg_default:.3}->{vg:.3}, w {w:.0}->{lapel_w:.0}");
-            match (&gorge_proposal, &lapel_pair) {
-                (Some((gy, gc)), Some(lp)) => eprintln!(
-                    "[detect] gorge y={gy:.1} (conf {gc:.2}), lapel pair {}/{} (conf {:.2})",
-                    lp.left_idx, lp.right_idx, lp.confidence
-                ),
-                (Some((gy, gc)), None) => {
-                    eprintln!("[detect] gorge y={gy:.1} (conf {gc:.2}), no lapel pair")
-                }
-                (None, Some(lp)) => eprintln!(
-                    "[detect] gorge heuristic, lapel pair {}/{} (conf {:.2})",
-                    lp.left_idx, lp.right_idx, lp.confidence
-                ),
-                (None, None) => eprintln!("[detect] gorge heuristic, no lapel pair"),
-            }
-        }
-
-        // Lapels: canonical right-side template, mirrored for the left.
-        // Path order per side is preserved (outer edge, curve, stitching,
-        // roll line). Note: mirroring makes the left lapel curve a true
-        // mirror of the right; the pre-#28 code had a latent asymmetry
-        // (`side * (brk.0 - peak.0)` double-applied the side, bowing the
-        // left curve outward). See PR #30 discussion.
-        let lapel_frame = Placement {
-            w: lapel_w,
-            ..frame
-        };
-        // Lapel/collar/gorge render only when the photo shows lapel
-        // structure (the detected lapel edge pair): a new garment without
-        // lapels must not get a blazer template drawn on it.
-        if lapel_pair.is_some() {
-            for mirror in [true, false] {
-                let side_frame = Placement {
-                    mirror,
-                    ..lapel_frame
-                };
-                // Template lapel: break -> notch -> peak -> brk.
-                // Placement is photo-driven (detector vg + edge search);
-                // shape work continues in template.rs.
-                let lapel = lapel_template_with_peak(vg, vb, 0.25);
-                push_rendered(&mut solid, &mut dashed, &lapel, &side_frame);
-                // Gorge seam (drawn once)
-                if mirror {
-                    push_rendered(
-                        &mut solid,
-                        &mut dashed,
-                        &gorge_seam_template(vg),
-                        &lapel_frame,
-                    );
-                }
-            }
-            // #17: front collar band between the notches (drawn once).
-            push_rendered(
-                &mut solid,
-                &mut dashed,
-                &front_collar_template(vg),
-                &lapel_frame,
-            );
-        } else if std::env::var("IM2VEC_FLAT_DEBUG").is_ok() {
-            eprintln!("[detect] no lapel pair — skipping lapel/collar templates");
-        }
-
-        // Pocket flaps (rounded rect + dashed topstitching), x centers traced
-        // from the detected flap chains — not fixed fractions of the view.
-        // Rendered only when the detector fires: no phantom pockets on
-        // garments that have none.
-        // #20 refinement: align pocket Y to bottom button row.
-        let pocket_y_default = y0 + 0.73 * h;
-        let pocket_y_refined = refine_pocket_y(buttons, x0, y0, x1, y1, pocket_y_default);
-        // #29: pocket detector proposes flap y and x centers; #27 search
-        // refines y against photo edges.
-        let pocket_proposal = detect::detect_pocket_flaps(chains, cx, w, pocket_y_refined)
-            .filter(|f| f.confidence >= detect::DETECT_CONFIDENCE_MIN);
-        if std::env::var("IM2VEC_FLAT_DEBUG").is_ok() {
-            match pocket_proposal {
-                Some(f) => eprintln!(
-                    "[detect] pocket y={:.1} x={:.0}/{:.0} (conf {:.2})",
-                    f.y, f.left_cx, f.right_cx, f.confidence
-                ),
-                None => eprintln!("[detect] no pocket pair — skipping pocket templates"),
-            }
-        }
-        if let Some(f) = pocket_proposal {
-            let pocket = pocket_template(w, h);
-            let pocket_y =
-                search::search_pocket_y(f.y, &pocket, f.left_cx, f.right_cx, w, h, &edges);
-            for &ax in &[f.left_cx, f.right_cx] {
-                let pocket_frame = Placement {
-                    ax,
-                    ay: pocket_y,
-                    w,
-                    h,
-                    mirror: false,
-                };
-                push_rendered(&mut solid, &mut dashed, &pocket, &pocket_frame);
-            }
-        }
-    }
-
-    // Back view: collar band + center back seam. The frame axis comes from
-    // mask moments (no buttons on a back view) instead of the bbox center.
-    if let Some(bi) = back_idx {
-        let c = &comps[bi];
-        let (x0, y0, x1, y1) = (c.x0 as f32, c.y0 as f32, c.x1 as f32, c.y1 as f32);
-        let w = x1 - x0;
-        let h = y1 - y0;
-        let view = detect::ViewContext::new(x0, y0, x1, y1);
-        let frame = Placement {
-            ax: detect::refine_axis_from_mask(mask, img_w, img_h, &view),
-            ay: y0,
-            w,
-            h,
-            mirror: false,
-        };
-        push_rendered(&mut solid, &mut dashed, &back_collar_template(), &frame);
-    }
-
-    (solid, dashed)
 }
 
 /// Generate procedural topstitching (dashed) as inward offsets of the
@@ -3330,118 +2926,5 @@ mod tests {
         assert!(worst < 1.0, "wiggle not smoothed, worst={worst:.2}");
         // Overall curve preserved: interior points near the arc.
         assert!((sm[50].1 - 0.01 * 50.0 * 50.0).abs() < 2.0);
-    }
-
-    #[test]
-    fn generate_structure_finds_front_and_back() {
-        // Mock: front component with 6 buttons, back component, sleeve.
-        let comps = vec![
-            Component {
-                area: 0,
-                x0: 0,
-                y0: 0,
-                x1: 0,
-                y1: 0,
-                symmetrized: false,
-            },
-            Component {
-                area: 200000,
-                x0: 163,
-                y0: 127,
-                x1: 659,
-                y1: 711,
-                symmetrized: true,
-            },
-            Component {
-                area: 50000,
-                x0: 702,
-                y0: 123,
-                x1: 939,
-                y1: 742,
-                symmetrized: false,
-            },
-            Component {
-                area: 190000,
-                x0: 978,
-                y0: 128,
-                x1: 1453,
-                y1: 710,
-                symmetrized: true,
-            },
-        ];
-        let buttons = vec![
-            Button {
-                cx: 360.0,
-                cy: 425.0,
-            },
-            Button {
-                cx: 463.0,
-                cy: 425.0,
-            },
-            Button {
-                cx: 373.0,
-                cy: 492.0,
-            },
-            Button {
-                cx: 451.0,
-                cy: 493.0,
-            },
-            Button {
-                cx: 373.0,
-                cy: 564.0,
-            },
-            Button {
-                cx: 449.0,
-                cy: 566.0,
-            },
-        ];
-        // Dummy curvature map for test (empty, no snapping will occur).
-        let dummy_curv = vec![0.0f32; 1600 * 900];
-        let dummy_map = shading::CurvatureMap::new(dummy_curv, 1600, 900);
-        // Empty mask: the back-view axis falls back to the bbox center.
-        let mask = vec![false; 1600 * 900];
-        let (solid, dashed) =
-            generate_structure(&buttons, &comps, &[], 1600, 900, &mask, &dummy_map);
-        // Back view always renders (collar + center back seam); the front
-        // needs photo evidence (button columns + detected chains), which the
-        // empty chain list does not provide.
-        assert!(!solid.is_empty(), "no solid structure paths");
-        assert!(!dashed.is_empty(), "no dashed structure paths");
-        // All points within the view bboxes (with margin).
-        for p in solid.iter().chain(dashed.iter()) {
-            for &(x, y) in p {
-                assert!(
-                    (100.0..=1500.0).contains(&x) && (100.0..=750.0).contains(&y),
-                    "structure point out of bounds: ({x:.1},{y:.1})"
-                );
-            }
-        }
-    }
-
-    #[test]
-    fn generate_structure_empty_without_buttons() {
-        let comps = vec![
-            Component {
-                area: 0,
-                x0: 0,
-                y0: 0,
-                x1: 0,
-                y1: 0,
-                symmetrized: false,
-            },
-            Component {
-                area: 200000,
-                x0: 163,
-                y0: 127,
-                x1: 659,
-                y1: 711,
-                symmetrized: true,
-            },
-        ];
-        let dummy_curv = vec![0.0f32; 1600 * 900];
-        let dummy_map = shading::CurvatureMap::new(dummy_curv, 1600, 900);
-        let mask = vec![false; 1600 * 900];
-        let (solid, dashed) = generate_structure(&[], &comps, &[], 1600, 900, &mask, &dummy_map);
-        assert!(solid.is_empty() && dashed.is_empty());
     }
 }
