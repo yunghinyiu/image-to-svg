@@ -216,7 +216,11 @@ fn rounded_rect_uv(
 /// reference tech pack: notch at 0.14w, peak at 0.25w / 0.24h, break at
 /// 0.09w; dashed topstitching inset 9px; roll line from neck to button.
 pub fn lapel_template(vg: f32, vb: f32) -> Template {
-    lapel_template_with_peak(vg, vb, 0.28f32)
+    // Scale down: use compact vb (not detector's tall vb).
+    // Target lapel is ~0.15h tall, not 0.32h.
+    // Peak at 0.26 (further out than notch_outer 0.16) for the jut.
+    let vb_compact = vg + 0.15f32;
+    lapel_template_with_peak(vg, vb_compact, 0.26f32)
 }
 
 /// Lapel template with explicit peak x position (for curvature-snapped placement).
@@ -230,26 +234,26 @@ pub fn lapel_template_with_peak(vg: f32, vb: f32, peak_x: f32) -> Template {
     //
     // The target shows a distinct notch step, not a smooth V. The peak
     // points outward (horizontally), not downward.
-    let gorge = (0.08f32, vg);
-    let notch_inner = (0.10f32, vg); // Notch start (horizontal)
-    let notch_outer = (0.18f32, vg + 0.002f32); // Notch end (horizontal step)
-    let peak = (peak_x, vg + 0.022f32); // Slightly below notch (flat shelf)
+    // Notched lapel with SHARP BREAK at collar-lapel junction (Jev conf 1.0).
+    // The break is a distinct angular corner where the collar ends and the
+    // lapel begins. The lapel's top edge is STRAIGHT from break to peak.
+    // Target shows a pronounced step, not a subtle one.
+    // PEAK MUST BE FURTHER OUT than notch_outer to create the jut.
+    let break_pt = (0.08f32, vg); // BREAK: collar ends here
+    let notch_outer = (0.16f32, vg + 0.003f32); // Step outward
+    let peak = (peak_x, vg + 0.030f32); // Peak FURTHER OUT (jut!)
     let brk = (0.10f32, vb); // Meets front edge
                              // (Old cubic curve rendered a rounded shield; removed per target.)
     Template {
         name: "lapel",
         paths: vec![
-            // Gorge: collar meets lapel (horizontal seam).
+            // BREAK: sharp corner where collar ends, lapel begins.
+            // Horizontal step outward (pronounced, not subtle).
             TPath::solid(vec![
-                TPoint::Norm(gorge.0, gorge.1),
-                TPoint::Norm(notch_inner.0, notch_inner.1),
-            ]),
-            // Notch V-cut: inner -> outer (the step).
-            TPath::solid(vec![
-                TPoint::Norm(notch_inner.0, notch_inner.1),
+                TPoint::Norm(break_pt.0, break_pt.1),
                 TPoint::Norm(notch_outer.0, notch_outer.1),
             ]),
-            // Lapel top edge: notch outer -> peak (juts outward).
+            // Lapel top edge: STRAIGHT from break to peak (sharp angle at break).
             TPath::solid(vec![
                 TPoint::Norm(notch_outer.0, notch_outer.1),
                 TPoint::Norm(peak.0, peak.1),
@@ -268,9 +272,9 @@ pub fn lapel_template_with_peak(vg: f32, vb: f32, peak_x: f32) -> Template {
                 TPoint::NormPx(peak.0, peak.1, -9.0, 0.0),
                 TPoint::NormPx(brk.0, brk.1, -9.0, 0.0),
             ]),
-            // Roll line: notch inner -> break (the V opening).
+            // Roll line: break -> brk (the V opening, straight).
             TPath::solid(vec![
-                TPoint::Norm(notch_inner.0, notch_inner.1),
+                TPoint::Norm(break_pt.0, break_pt.1),
                 TPoint::Norm(brk.0, brk.1),
             ]),
         ],
@@ -531,12 +535,12 @@ mod tests {
 
     #[test]
     fn lapel_template_has_expected_path_count() {
-        // Notched lapel: 4 solid (gorge, notch V, top edge, outer edge)
-        // + 2 dashed stitching + 1 solid roll = 7 paths.
+        // Notched lapel with break: 1 break step + 2 solid lapel edges
+        // + 2 dashed stitching + 1 solid roll = 6 paths.
         let t = lapel_template(0.09, 0.4);
-        assert_eq!(t.paths.len(), 7);
+        assert_eq!(t.paths.len(), 6);
         assert_eq!(t.paths.iter().filter(|p| p.dashed).count(), 2);
-        // Angular lapel: straight lines have 2 points each.
+        // All straight lines have 2 points each.
         for p in &t.paths {
             assert_eq!(p.points.len(), 2);
         }

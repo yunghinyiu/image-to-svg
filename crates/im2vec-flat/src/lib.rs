@@ -2412,10 +2412,9 @@ fn generate_structure(
             let (_nx, ny) = curvature_map.snap_to_ridge(notch_px.0, notch_px.1, 25.0, 0.3);
             // Convert back to normalized: vg from snapped notch y.
             let vg_s = (ny - y0) / h;
-            // Peak x: use fixed 0.28 (target-measured compact lapel). Curvature
-            // snaps inward to the roll fold, not the outer peak edge.
-            let peak_x_s = 0.28f32;
-            eprintln!("[lapel-snap] vg {:.3}->{:.3} peak_x fixed 0.28", vg, vg_s);
+            // Peak x: 0.26 (further out than notch 0.16 for the jut).
+            let peak_x_s = 0.26f32;
+            eprintln!("[lapel-snap] vg {:.3}->{:.3} peak_x fixed 0.26", vg, vg_s);
             // Only accept the snap if it's within reasonable bounds of the default.
             let vg_final = if (vg_s - vg).abs() < 0.05 { vg_s } else { vg };
             (vg_final, peak_x_s)
