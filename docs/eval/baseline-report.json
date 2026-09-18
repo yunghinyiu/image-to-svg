@@ -1,0 +1,204 @@
+{
+  "silhouette_iou": 0.8565278382431191,
+  "chamfer_px": 8.512350778733909,
+  "chamfer_ours_to_target_px": 9.445124889077055,
+  "chamfer_target_to_ours_px": 7.579576668390763,
+  "chamfer_normalized": 0.008312842557357333,
+  "ink_ratio_ours_to_target": 1.835238182316906,
+  "ink_pixels_ours": 20072,
+  "ink_pixels_target": 10937,
+  "path_count": 212,
+  "buttons_ours": 5,
+  "buttons_target": 15,
+  "buttons_matched": 3,
+  "button_position_error_px": 9.968847751617432,
+  "button_match_tolerance_px": 30.72,
+  "eval_canvas_target": [
+    1024,
+    683
+  ],
+  "eval_canvas_ours": [
+    1024,
+    576
+  ],
+  "svg_size": [
+    1600,
+    900
+  ],
+  "ours_bbox_norm": [
+    0.1015625,
+    0.13715278,
+    0.9091797,
+    0.8263889
+  ],
+  "target_bbox_norm": [
+    0.036132812,
+    0.105417274,
+    0.9746094,
+    0.84626645
+  ],
+  "blobs_ours": [
+    {
+      "cx": 809.26636,
+      "cy": 167.52478,
+      "radius": 10.713878,
+      "area": 652,
+      "circularity": 0.035709716,
+      "radial_cv": 0.23658128
+    },
+    {
+      "cx": 844.4401,
+      "cy": 174.53383,
+      "radius": 4.615466,
+      "area": 121,
+      "circularity": 0.18771987,
+      "radial_cv": 0.32153505
+    },
+    {
+      "cx": 193.38885,
+      "cy": 366.97522,
+      "radius": 7.4587564,
+      "area": 316,
+      "circularity": 0.08590531,
+      "radial_cv": 0.3149815
+    },
+    {
+      "cx": 247.99503,
+      "cy": 422.79324,
+      "radius": 6.2798157,
+      "area": 224,
+      "circularity": 0.09087252,
+      "radial_cv": 0.34511307
+    },
+    {
+      "cx": 665.34076,
+      "cy": 505.2013,
+      "radius": 8.286196,
+      "area": 390,
+      "circularity": 0.054454274,
+      "radial_cv": 0.31699818
+    }
+  ],
+  "blobs_target": [
+    {
+      "cx": 272.3852,
+      "cy": 311.34814,
+      "radius": 3.5682483,
+      "area": 90,
+      "circularity": 0.13962634,
+      "radial_cv": 0.05278707
+    },
+    {
+      "cx": 185.48485,
+      "cy": 311.40152,
+      "radius": 3.5283782,
+      "area": 88,
+      "circularity": 0.1461013,
+      "radial_cv": 0.051299736
+    },
+    {
+      "cx": 264.31784,
+      "cy": 361.97675,
+      "radius": 3.4880528,
+      "area": 86,
+      "circularity": 0.1461206,
+      "radial_cv": 0.052702483
+    },
+    {
+      "cx": 201.1236,
+      "cy": 362.0899,
+      "radius": 3.5483692,
+      "area": 89,
+      "circularity": 0.14119518,
+      "radial_cv": 0.05401732
+    },
+    {
+      "cx": 201.14635,
+      "cy": 418.92685,
+      "radius": 3.4059694,
+      "area": 82,
+      "circularity": 0.15324841,
+      "radial_cv": 0.06203412
+    },
+    {
+      "cx": 262.93164,
+      "cy": 419.0,
+      "radius": 3.3218584,
+      "area": 78,
+      "circularity": 0.16110732,
+      "radial_cv": 0.04786602
+    },
+    {
+      "cx": 662.8439,
+      "cy": 500.4726,
+      "radius": 3.3430843,
+      "area": 79,
+      "circularity": 0.16743857,
+      "radial_cv": 0.09993076
+    },
+    {
+      "cx": 969.7131,
+      "cy": 502.076,
+      "radius": 3.3430843,
+      "area": 79,
+      "circularity": 0.15906799,
+      "radial_cv": 0.0776653
+    },
+    {
+      "cx": 660.87244,
+      "cy": 518.3457,
+      "radius": 3.3851376,
+      "area": 81,
+      "circularity": 0.17167753,
+      "radial_cv": 0.10267362
+    },
+    {
+      "cx": 971.8519,
+      "cy": 518.97943,
+      "radius": 3.3851376,
+      "area": 81,
+      "circularity": 0.15514039,
+      "radial_cv": 0.070216306
+    },
+    {
+      "cx": 527.19214,
+      "cy": 519.38824,
+      "radius": 3.467714,
+      "area": 85,
+      "circularity": 0.14783965,
+      "radial_cv": 0.057302285
+    },
+    {
+      "cx": 658.77423,
+      "cy": 534.68823,
+      "radius": 3.6272316,
+      "area": 93,
+      "circularity": 0.16175398,
+      "radial_cv": 0.10391734
+    },
+    {
+      "cx": 973.7724,
+      "cy": 535.95123,
+      "radius": 3.4059694,
+      "area": 82,
+      "circularity": 0.16936922,
+      "radial_cv": 0.07052741
+    },
+    {
+      "cx": 523.2031,
+      "cy": 537.21075,
+      "radius": 3.5082736,
+      "area": 87,
+      "circularity": 0.14444105,
+      "radial_cv": 0.06672151
+    },
+    {
+      "cx": 519.447,
+      "cy": 555.59094,
+      "radius": 3.5283782,
+      "area": 88,
+      "circularity": 0.1461013,
+      "radial_cv": 0.059994537
+    }
+  ]
+}
