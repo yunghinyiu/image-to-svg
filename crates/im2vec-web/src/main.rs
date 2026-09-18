@@ -143,6 +143,7 @@ async fn api_convert(mut mp: Multipart) -> Result<Json<ConvertResponse>, (Status
                 &FlatOptions {
                     input: FlatInput::parse(&flat_input),
                     symmetrize: true,
+                    symmetrize_lines: false,
                     outline_width: 2.0,
                     detail_strength: 0.6,
                     speckle,
