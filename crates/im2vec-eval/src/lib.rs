@@ -26,6 +26,18 @@ use std::collections::HashMap;
 
 /// Max side (px) of every canvas metrics are computed on.
 pub const EVAL_MAX_SIDE: u32 = 1024;
+
+/// Ink thresholds for the native-resolution ratio (#18). The 1024px eval
+/// canvas downscales the target with bilinear filtering, blurring its 2px
+/// lines into a gray gradient (median ~147) with no fair threshold — so the
+/// ink *ratio* is counted on the crisp native renders instead. The target's
+/// antialiased lines need 128 to avoid counting the halo; our crisp resvg
+/// render needs 200 to catch all ink. (The 1024px masks keep their 128/200
+/// thresholds for chamfer point positions.)
+/// Native-res ink threshold for the target PNG (#18).
+pub const INK_THRESH_TARGET_NATIVE: u8 = 128;
+/// Native-res ink threshold for our SVG render (#18).
+pub const INK_THRESH_OURS_NATIVE: u8 = 200;
 /// Max ink points sampled per side for Chamfer.
 pub const CHAMFER_MAX_POINTS: usize = 20_000;
 
@@ -786,7 +798,8 @@ pub fn run_eval(input_png: &[u8], target_png: &[u8], opts: &FlatOptions) -> Resu
     let target_ink = ink_mask(&target, 128);
     let target_sil = silhouette_from_lineart(&target);
     let target_pts = sample_points(&target_ink, CHAMFER_MAX_POINTS);
-    let target_ink_n = target_ink.pixels().filter(|p| p[0] > 0).count();
+    // Note: ink *counts* for the ratio come from the native-res renders
+    // below (#18); the 1024px mask is only for chamfer point positions.
 
     // 3. our output on the eval canvas
     let ours_rgba = rasterize_svg(&flat.svg, EVAL_MAX_SIDE)?;
@@ -794,7 +807,7 @@ pub fn run_eval(input_png: &[u8], target_png: &[u8], opts: &FlatOptions) -> Resu
     let ours_gray: GrayImage = image::imageops::grayscale(&ours_rgba);
     let ours_ink = ink_mask(&ours_gray, 200);
     let ours_pts = sample_points(&ours_ink, CHAMFER_MAX_POINTS);
-    let ours_ink_n = ours_ink.pixels().filter(|p| p[0] > 0).count();
+    // (ink count for the ratio: see native-res below)
     let ours_mask = image::imageops::resize(&mask_full, ow, oh, FilterType::Nearest);
     anyhow::ensure!(
         mask_full.width() == sw && mask_full.height() == sh,
@@ -824,6 +837,17 @@ pub fn run_eval(input_png: &[u8], target_png: &[u8], opts: &FlatOptions) -> Resu
     let (nw, _nh) = (ours_native_rgba.width(), ours_native_rgba.height());
     let ours_gray_native: GrayImage = image::imageops::grayscale(&ours_native_rgba);
     let ours_ink_native = ink_mask(&ours_gray_native, 200);
+    // Ink ratio at native resolution (#18): count crisp ink pixels with the
+    // evidence-backed thresholds (target 128, ours 200). (Button masks above
+    // keep their tuned thresholds; this is only the ratio.)
+    let target_ink_n = target_full
+        .pixels()
+        .filter(|p| p[0] < INK_THRESH_TARGET_NATIVE)
+        .count();
+    let ours_ink_n = ours_gray_native
+        .pixels()
+        .filter(|p| p[0] < INK_THRESH_OURS_NATIVE)
+        .count();
     let scale_t = tw as f32 / target_full.width() as f32;
     let scale_o = ow as f32 / nw as f32;
     let target_blobs: Vec<Blob> = detect_blobs(&target_ink_native, 40, 9000, 0.55)
