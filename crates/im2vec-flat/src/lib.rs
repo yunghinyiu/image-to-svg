@@ -125,7 +125,7 @@ fn convert_flat_rgb(rgb: &RgbImage, opts: &FlatOptions) -> Result<FlatOutput> {
 
     // 1. foreground mask via backdrop keying.
     let t = Instant::now();
-    let mut mask = foreground_mask(&lum, w, h);
+    let mut mask = smooth_mask(&foreground_mask(&lum, w, h), w, h, 2);
     if opts.symmetrize {
         symmetrize_mask(&mut mask, w, h);
     }
@@ -137,7 +137,7 @@ fn convert_flat_rgb(rgb: &RgbImage, opts: &FlatOptions) -> Result<FlatOutput> {
     // 2. silhouette pass: black garment on white.
     let t = Instant::now();
     let sil_img = mask_to_color(&mask, w, h);
-    let sil = convert_image(&sil_img, w, h, &trace_opts(opts.speckle))?;
+    let sil = convert_image(&sil_img, w, h, &trace_opts(opts.speckle, 2.5))?;
     stage(&mut stages, "trace silhouette", t);
     let sil_paths = extract_paths(&sil.svg);
     if sil_paths.is_empty() {
@@ -168,7 +168,7 @@ fn convert_flat_rgb(rgb: &RgbImage, opts: &FlatOptions) -> Result<FlatOutput> {
     stage(&mut stages, "XDoG linework", t);
     let t = Instant::now();
     let det_img = gray_to_color(&lines, w, h);
-    let det = convert_image(&det_img, w, h, &trace_opts(opts.speckle))?;
+    let det = convert_image(&det_img, w, h, &trace_opts(opts.speckle, 1.0))?;
     stage(&mut stages, "trace details", t);
     let det_paths = extract_paths(&det.svg);
 
@@ -213,13 +213,13 @@ fn convert_flat_rgb(rgb: &RgbImage, opts: &FlatOptions) -> Result<FlatOutput> {
     })
 }
 
-fn trace_opts(speckle: usize) -> ConvertOptions {
+fn trace_opts(speckle: usize, simplify: f64) -> ConvertOptions {
     ConvertOptions {
         preset: ImPreset::Mono, // forces binary clustering
         mode: "spline".into(),
         hierarchical: "stacked".into(),
         filter_speckle: speckle,
-        simplify: Some(1.0),
+        simplify: Some(simplify),
         path_precision: 2,
         max_colors: None,
         ..Default::default()
@@ -424,6 +424,35 @@ fn downscale_area(rgb: &RgbImage, nw: u32, nh: u32) -> RgbImage {
     out
 }
 
+fn dilate(mask: &[bool], w: u32, h: u32, r: usize) -> Vec<bool> {
+    let (w, h) = (w as usize, h as usize);
+    let mut out = vec![false; w * h];
+    for y in 0..h {
+        for x in 0..w {
+            if !mask[y * w + x] {
+                continue;
+            }
+            let y0 = y.saturating_sub(r);
+            let y1 = (y + r + 1).min(h);
+            let x0 = x.saturating_sub(r);
+            let x1 = (x + r + 1).min(w);
+            for yy in y0..y1 {
+                for xx in x0..x1 {
+                    out[yy * w + xx] = true;
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Open then close: removes boundary notches and bumps so the traced
+/// silhouette becomes a few clean curves instead of jitter.
+fn smooth_mask(mask: &[bool], w: u32, h: u32, r: usize) -> Vec<bool> {
+    let opened = dilate(&erode(mask, w, h, r), w, h, r);
+    erode(&dilate(&opened, w, h, r), w, h, r)
+}
+
 fn erode(mask: &[bool], w: u32, h: u32, r: usize) -> Vec<bool> {
     let (w, h) = (w as usize, h as usize);
     let mut out = vec![false; w * h];
@@ -562,9 +591,99 @@ fn xdog_lines(lum: &[f32], w: u32, h: u32, strength: f32) -> Vec<u8> {
         }
     }
     if sw == w && sh == h {
-        return bin;
+        return close_u8(&bin_thinned(bin, sw, sh), w, h);
     }
-    upscale_nearest_u8(&bin, sw, sh, w, h)
+    let up = upscale_nearest_u8(&bin_thinned(bin, sw, sh), sw, sh, w, h);
+    close_u8(&up, w, h)
+}
+
+/// Morphological close (dilate then erode, r=1) on a 0/255 buffer.
+/// Bridges single-pixel corner gaps in upscaled staircase diagonals so the
+/// tracer sees connected strokes instead of dotted fragments.
+fn close_u8(g: &[u8], w: u32, h: u32) -> Vec<u8> {
+    let b: Vec<bool> = g.iter().map(|&v| v < 128).collect();
+    let closed = erode(&dilate(&b, w, h, 1), w, h, 1);
+    closed
+        .iter()
+        .map(|&v| if v { 0u8 } else { 255u8 })
+        .collect()
+}
+
+/// Thin a small binary buffer to its 1px centerline skeleton so traced
+/// details render as uniform pen strokes instead of variable-width blobs.
+fn bin_thinned(bin: Vec<u8>, sw: u32, sh: u32) -> Vec<u8> {
+    let mut skel = zhang_suen(&bin, sw as usize, sh as usize);
+    // Post-thin sweep: drop dot fragments the skeleton left behind.
+    sweep_small(&mut skel, sw as usize, sh as usize, 10);
+    let mut thin = vec![255u8; skel.len()];
+    for (i, &k) in skel.iter().enumerate() {
+        if k {
+            thin[i] = 0;
+        }
+    }
+    thin
+}
+
+/// Zhang-Suen thinning: reduce foreground (<128) to a 1px 8-connected
+/// skeleton. Iterates two sub-cycles until no pixel changes (capped).
+fn zhang_suen(v: &[u8], w: usize, h: usize) -> Vec<bool> {
+    let mut fg: Vec<bool> = v.iter().map(|&px| px < 128).collect();
+    // Neighbor offsets in p2..p9 order: N, NE, E, SE, S, SW, W, NW.
+    const DX: [i32; 8] = [0, 1, 1, 1, 0, -1, -1, -1];
+    const DY: [i32; 8] = [-1, -1, 0, 1, 1, 1, 0, -1];
+    for _ in 0..100 {
+        let mut removed_any = false;
+        for step in 0..2 {
+            let mut remove = Vec::new();
+            for y in 1..h.saturating_sub(1) {
+                for x in 1..w.saturating_sub(1) {
+                    let i = y * w + x;
+                    if !fg[i] {
+                        continue;
+                    }
+                    let mut n = [false; 8];
+                    for (k, px) in n.iter_mut().enumerate() {
+                        let nx = x as i32 + DX[k];
+                        let ny = y as i32 + DY[k];
+                        *px = fg[ny as usize * w + nx as usize];
+                    }
+                    let b = n.iter().filter(|&&b| b).count();
+                    if !(2..=6).contains(&b) {
+                        continue;
+                    }
+                    let mut a = 0;
+                    for k in 0..8 {
+                        if !n[k] && n[(k + 1) % 8] {
+                            a += 1;
+                        }
+                    }
+                    if a != 1 {
+                        continue;
+                    }
+                    // p2=N, p4=E, p6=S, p8=W in n[0..8] order.
+                    let (p2, p4, p6, p8) = (n[0], n[2], n[4], n[6]);
+                    let ok = if step == 0 {
+                        !(p2 && p4 && p6) && !(p4 && p6 && p8)
+                    } else {
+                        !(p2 && p4 && p8) && !(p2 && p6 && p8)
+                    };
+                    if ok {
+                        remove.push(i);
+                    }
+                }
+            }
+            if !remove.is_empty() {
+                removed_any = true;
+                for i in remove {
+                    fg[i] = false;
+                }
+            }
+        }
+        if !removed_any {
+            break;
+        }
+    }
+    fg
 }
 
 /// Keep pixels darker than `low` that connect (8-way) to a pixel darker
@@ -640,13 +759,25 @@ fn sweep_small(kept: &mut [bool], w: usize, h: usize, min_size: usize) {
 
 /// Nearest-sample a u8 gray image straight from the float luminance buffer.
 fn sample_gray(lum: &[f32], w: usize, h: usize, sw: u32, sh: u32) -> GrayImage {
+    // Box-average (not nearest point): nearest sampling aliases the edge
+    // phase row-to-row, which dithers the threshold into dotted lines.
     let (sw, sh) = (sw as usize, sh as usize);
     let mut raw = vec![0u8; sw * sh];
     for y in 0..sh {
-        let sy = (y * h / sh).min(h - 1);
+        let y0 = y * h / sh;
+        let y1 = ((y + 1) * h / sh).max(y0 + 1);
         for x in 0..sw {
-            let sx = (x * w / sw).min(w - 1);
-            raw[y * sw + x] = (lum[sy * w + sx].clamp(0.0, 1.0) * 255.0) as u8;
+            let x0 = x * w / sw;
+            let x1 = ((x + 1) * w / sw).max(x0 + 1);
+            let mut acc = 0.0f32;
+            let mut n = 0u32;
+            for sy in y0..y1 {
+                for sx in x0..x1 {
+                    acc += lum[sy * w + sx];
+                    n += 1;
+                }
+            }
+            raw[y * sw + x] = ((acc / n as f32).clamp(0.0, 1.0) * 255.0) as u8;
         }
     }
     GrayImage::from_raw(sw as u32, sh as u32, raw).expect("small gray")
@@ -803,6 +934,39 @@ mod tests {
         assert!(!e[2 * 9 + 2], "original corner eaten");
         assert!(!e[0], "outside stays out");
         assert_eq!(e.iter().filter(|&&b| b).count(), 9);
+    }
+
+    #[test]
+    fn thinning_reduces_bar_to_centerline() {
+        // 9x9 canvas, 3px-wide horizontal bar -> single center row.
+        let mut m = vec![255u8; 81];
+        for y in 3..6 {
+            for x in 1..8 {
+                m[y * 9 + x] = 0;
+            }
+        }
+        let t = zhang_suen(&m, 9, 9);
+        // Center span survives (blunt ends may shorten asymmetrically by a
+        // pixel — known directional bias of two-subcycle thinning).
+        for x in 3..6 {
+            assert!(t[4 * 9 + x], "center survives at {x}");
+        }
+        assert!(!t[3 * 9 + 4] && !t[5 * 9 + 4], "outer rows eaten");
+    }
+
+    #[test]
+    fn smooth_mask_keeps_centered_bulk() {
+        // 20x20 block centered in 30x30 + lone speck: open+close keeps the
+        // block exactly and drops the speck.
+        let mut m = vec![false; 900];
+        for y in 5..25 {
+            for x in 5..25 {
+                m[y * 30 + x] = true;
+            }
+        }
+        m[0] = true;
+        let s = smooth_mask(&m, 30, 30, 2);
+        assert_eq!(s.iter().filter(|&&b| b).count(), 400);
     }
 
     #[test]
