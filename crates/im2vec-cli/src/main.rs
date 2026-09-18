@@ -66,13 +66,14 @@ struct Args {
     #[arg(long, default_value = "flatlay")]
     flat_input: String,
     /// flat preset only: mirror-average around the vertical center axis
-    #[arg(long, default_value_t = true)]
+    /// (bare flag = on; accepts `--symmetrize false` to disable)
+    #[arg(long, default_value_t = true, default_missing_value = "true", num_args(0..=1))]
     symmetrize: bool,
     /// flat preset only: also mirror the detail linework (off: logos/pockets stay put)
-    #[arg(long, default_value_t = false)]
+    #[arg(long, default_value_t = false, default_missing_value = "true", num_args(0..=1))]
     symmetrize_lines: bool,
     /// flat preset only: render details as dashed stitch strokes (solid = seam)
-    #[arg(long, default_value_t = false)]
+    #[arg(long, default_value_t = false, default_missing_value = "true", num_args(0..=1))]
     stitch_dashes: bool,
     /// flat preset only: silhouette outline stroke width in px
     #[arg(long, default_value_t = 2.0)]

@@ -5,7 +5,9 @@
 //!
 //! 1. background keying (backdrop color estimated from border pixels)
 //! 2. XDoG stylized line extraction for seams, folds, trims
-//! 3. mirror symmetrization around the vertical center axis
+//! 3. per-view mirror symmetrization around each garment view's own
+//!    center axis (multi-view front/side/back inputs keep every view;
+//!    asymmetric side views pass through untouched)
 //! 4. two vtracer passes (silhouette + detail linework) composed into one
 //!    flat-style SVG: white garment, dark outline stroke, dark inner lines.
 //!
@@ -130,8 +132,11 @@ fn convert_flat_rgb(rgb: &RgbImage, opts: &FlatOptions) -> Result<FlatOutput> {
     // 1. foreground mask via backdrop keying.
     let t = Instant::now();
     let mut mask = smooth_mask(&foreground_mask(&lum, w, h), w, h, 2);
+    let (labels, mut comps) = label_components(&mask, w as usize, h as usize);
     if opts.symmetrize {
-        symmetrize_mask(&mut mask, w, h);
+        // Per-view: no cross-view contamination, no re-label needed (the
+        // mirror pass never steals pixels from a neighbouring view).
+        symmetrize_components(&mut mask, &labels, &mut comps, w as usize, h as usize);
     }
     stage(&mut stages, "background keying", t);
     if !mask.iter().any(|&b| b) {
@@ -163,7 +168,7 @@ fn convert_flat_rgb(rgb: &RgbImage, opts: &FlatOptions) -> Result<FlatOutput> {
     let t = Instant::now();
     let region = erode(&mask, w, h, 2);
     let deep = erode(&mask, w, h, 4);
-    let mut xd = xdog_lines(&lum, w, h, opts.detail_strength);
+    let mut xd = xdog_lines(rgb, opts.detail_strength);
     let mut lines = xd.full.clone();
     for (i, v) in lines.iter_mut().enumerate() {
         if !region[i] {
@@ -171,10 +176,25 @@ fn convert_flat_rgb(rgb: &RgbImage, opts: &FlatOptions) -> Result<FlatOutput> {
         }
     }
     if opts.symmetrize_lines {
-        symmetrize_gray_max(&mut lines, w, h);
+        // Mirror the linework only inside views judged symmetric above, each
+        // around its own axis (asymmetric details stay where they are).
+        symmetrize_gray_max_components(&mut lines, &comps, w, h);
+        let (fx, fy) = (xd.sw as f32 / w as f32, xd.sh as f32 / h as f32);
         for c in xd.chains.iter_mut() {
-            for p in c.iter_mut() {
-                p.0 = xd.sw as f32 - 1.0 - p.0;
+            if c.is_empty() {
+                continue;
+            }
+            let (mx, my) = c[c.len() / 2];
+            for comp in comps.iter().skip(1).filter(|c| c.symmetrized) {
+                let (bx0, bx1) = (comp.x0 as f32 * fx, comp.x1 as f32 * fx);
+                let (by0, by1) = (comp.y0 as f32 * fy, comp.y1 as f32 * fy);
+                if mx >= bx0 && mx < bx1 && my >= by0 && my < by1 {
+                    let cx = (bx0 + bx1 - 1.0) / 2.0;
+                    for p in c.iter_mut() {
+                        p.0 = 2.0 * cx - p.0;
+                    }
+                    break;
+                }
             }
         }
     }
@@ -304,7 +324,8 @@ fn median(mut v: Vec<f32>) -> f32 {
 /// Handles light backdrops (dark garment) and dark backdrops (light garment).
 /// Border-connected background is flood-filled so enclosed holes (neck hole,
 /// gaps between limbs) stay part of the silhouette; stray exterior specks are
-/// dropped by keeping the largest connected component.
+/// dropped by size while every garment view is kept (multi-view
+/// front/side/back inputs survive intact).
 fn foreground_mask(lum: &[f32], w: u32, h: u32) -> Vec<bool> {
     let (w, h) = (w as usize, h as usize);
     let mut border = Vec::with_capacity(2 * (w + h));
@@ -355,14 +376,39 @@ fn foreground_mask(lum: &[f32], w: u32, h: u32) -> Vec<bool> {
         *f = *f || !is_bg[i];
     }
 
-    keep_largest_component(&mut fg, w, h);
+    // Size floor scales with resolution: specks vanish, every garment view
+    // (even a narrow side view at ~5% of the frame) survives.
+    let min_area = ((w * h) / 2000).max(64);
+    sweep_small_components(&mut fg, w, h, min_area);
     fg
 }
 
-/// Zero all but the largest 4-connected foreground component.
-fn keep_largest_component(fg: &mut [bool], w: usize, h: usize) {
+/// One 4-connected foreground blob: pixel count plus bounding box
+/// (x1/y1 exclusive).
+#[derive(Debug, Clone)]
+struct Component {
+    area: usize,
+    x0: usize,
+    y0: usize,
+    x1: usize,
+    y1: usize,
+    /// Set once per-view symmetrization judged this view near-symmetric.
+    symmetrized: bool,
+}
+
+/// Label every 4-connected foreground component. Returns the per-pixel
+/// label image (0 = background, 1-based component ids) plus one
+/// [`Component`] per id (index 0 unused).
+fn label_components(fg: &[bool], w: usize, h: usize) -> (Vec<u32>, Vec<Component>) {
     let mut labels = vec![0u32; w * h];
-    let mut sizes: Vec<usize> = vec![0]; // 1-based
+    let mut comps: Vec<Component> = vec![Component {
+        area: 0,
+        x0: 0,
+        y0: 0,
+        x1: 0,
+        y1: 0,
+        symmetrized: false,
+    }]; // 1-based
     let mut next = 0u32;
     for i in 0..w * h {
         if !fg[i] || labels[i] != 0 {
@@ -370,14 +416,18 @@ fn keep_largest_component(fg: &mut [bool], w: usize, h: usize) {
         }
         next += 1;
         let mut stack = vec![i];
-        let mut size = 0;
+        let (mut area, mut x0, mut y0, mut x1, mut y1) = (0usize, w, h, 0usize, 0usize);
         while let Some(j) = stack.pop() {
             if !fg[j] || labels[j] != 0 {
                 continue;
             }
             labels[j] = next;
-            size += 1;
             let (x, y) = (j % w, j / w);
+            area += 1;
+            x0 = x0.min(x);
+            y0 = y0.min(y);
+            x1 = x1.max(x + 1);
+            y1 = y1.max(y + 1);
             if x > 0 {
                 stack.push(j - 1);
             }
@@ -391,46 +441,105 @@ fn keep_largest_component(fg: &mut [bool], w: usize, h: usize) {
                 stack.push(j + w);
             }
         }
-        sizes.push(size);
+        comps.push(Component {
+            area,
+            x0,
+            y0,
+            x1,
+            y1,
+            symmetrized: false,
+        });
     }
-    if next == 0 {
-        return;
-    }
-    let best = sizes
-        .iter()
-        .enumerate()
-        .skip(1)
-        .max_by_key(|&(_, &s)| s)
-        .map(|(l, _)| l as u32)
-        .unwrap();
+    (labels, comps)
+}
+
+/// Zero connected components smaller than `min_area` px (area opening on the
+/// mask). Unlike keep-largest, every garment view survives multi-view inputs.
+fn sweep_small_components(fg: &mut [bool], w: usize, h: usize, min_area: usize) {
+    let (labels, comps) = label_components(fg, w, h);
     for (i, f) in fg.iter_mut().enumerate() {
-        if *f && labels[i] != best {
+        if *f && comps[labels[i] as usize].area < min_area {
             *f = false;
         }
     }
 }
 
-fn symmetrize_mask(mask: &mut [bool], w: u32, h: u32) {
-    let (w, h) = (w as usize, h as usize);
-    for y in 0..h {
-        for x in 0..w / 2 {
-            let (a, b) = (y * w + x, y * w + (w - 1 - x));
-            let v = mask[a] || mask[b];
-            mask[a] = v;
-            mask[b] = v;
+/// Mirror-average each garment view around its own vertical center axis.
+/// Views already near-symmetric (front/back) get the wrinkle-averaging the
+/// old global pass provided; asymmetric views (side/profile) pass through
+/// untouched, since mirroring them would fabricate a phantom silhouette.
+/// `labels` is the label image for the same mask revision; the mirror union
+/// never steals pixels from a neighbouring view, so no re-label is needed.
+/// Per-view success lands in `comps[i].symmetrized` for the linework pass.
+fn symmetrize_components(
+    mask: &mut [bool],
+    labels: &[u32],
+    comps: &mut [Component],
+    w: usize,
+    h: usize,
+) {
+    // Max relative area growth admitted from the mirror union: symmetric
+    // fronts/backs stay far below this, side views grow far above it.
+    const MAX_GROWTH: f32 = 0.15;
+    for (id, comp) in comps.iter_mut().enumerate().skip(1) {
+        let label = id as u32;
+        let (x0, x1, y0, y1) = (comp.x0, comp.x1, comp.y0, comp.y1);
+        if x1 <= x0 + 1 || y1 <= y0 || x1 > w || y1 > h {
+            continue;
         }
+        // Dry run: count the union growth without writing. Mirror of (x,y)
+        // is (x0+x1-1-x, y). Pixels owned by a neighbouring view are skipped.
+        let mut added = 0usize;
+        for y in y0..y1 {
+            for x in x0..x1 {
+                let i = y * w + x;
+                if mask[i] || (labels[i] != 0 && labels[i] != label) {
+                    continue;
+                }
+                if mask[y * w + (x0 + x1 - 1 - x)] {
+                    added += 1;
+                }
+            }
+        }
+        if added as f32 > comp.area as f32 * MAX_GROWTH {
+            continue; // asymmetric view (e.g. side/profile): leave alone
+        }
+        for y in y0..y1 {
+            for x in x0..x1 {
+                let i = y * w + x;
+                if mask[i] || (labels[i] != 0 && labels[i] != label) {
+                    continue;
+                }
+                if mask[y * w + (x0 + x1 - 1 - x)] {
+                    mask[i] = true;
+                }
+            }
+        }
+        comp.symmetrized = true;
     }
 }
 
-/// Mirror-max: each mirrored pair takes the darker (stronger-line) value.
-fn symmetrize_gray_max(g: &mut [u8], w: u32, h: u32) {
+/// Mirror-max inside each symmetrized view's own bounding box: each mirrored
+/// pair takes the darker (stronger-line) value. Asymmetric views are skipped.
+fn symmetrize_gray_max_components(g: &mut [u8], comps: &[Component], w: u32, h: u32) {
     let (w, h) = (w as usize, h as usize);
-    for y in 0..h {
-        for x in 0..w / 2 {
-            let (a, b) = (y * w + x, y * w + (w - 1 - x));
-            let v = g[a].min(g[b]);
-            g[a] = v;
-            g[b] = v;
+    for comp in comps.iter().skip(1).filter(|c| c.symmetrized) {
+        let (x0, x1, y0, y1) = (
+            comp.x0.min(w),
+            comp.x1.min(w),
+            comp.y0.min(h),
+            comp.y1.min(h),
+        );
+        if x1 <= x0 + 1 || y1 <= y0 {
+            continue;
+        }
+        for y in y0..y1 {
+            for x in x0..(x0 + x1) / 2 {
+                let (a, b) = (y * w + x, y * w + (x0 + x1 - 1 - x));
+                let v = g[a].min(g[b]);
+                g[a] = v;
+                g[b] = v;
+            }
         }
     }
 }
@@ -579,6 +688,11 @@ fn gauss_blur(gray: &GrayImage, sigma: f32) -> GrayImage {
 
 /// Extended Difference-of-Gaussians: dark stylized lines on white.
 /// `strength` 0..=1 maps to the epsilon threshold (lower eps = more lines).
+///
+/// Color-aware: the DoG valley response is computed per R/G/B channel and
+/// OR-ed (a line registers when ANY channel dips). Luminance-only XDoG is
+/// blind to near-isoluminant edges — gold buttons on blue denim, white
+/// contrast stitching — which all move chroma far more than luminance.
 /// XDoG output: full-res binary for previews plus vector chains in small-px.
 struct XdogOut {
     full: Vec<u8>,
@@ -587,7 +701,8 @@ struct XdogOut {
     sh: u32,
 }
 
-fn xdog_lines(lum: &[f32], w: u32, h: u32, strength: f32) -> XdogOut {
+fn xdog_lines(rgb: &RgbImage, strength: f32) -> XdogOut {
+    let (w, h) = (rgb.width(), rgb.height());
     let (wu, hu) = (w as usize, h as usize);
     // Compute the response at reduced resolution (edges survive downscaling)
     // with hand-rolled sampling: the generic ops resize is ~1s at 2MP.
@@ -597,36 +712,35 @@ fn xdog_lines(lum: &[f32], w: u32, h: u32, strength: f32) -> XdogOut {
         ((w as f32 * scale).round() as u32).max(1),
         ((h as f32 * scale).round() as u32).max(1),
     );
-    let debug = std::env::var("IM2VEC_FLAT_DEBUG").is_ok();
-    let t = Instant::now();
-    let small = sample_gray(lum, wu, hu, sw, sh);
-    let b1 = fast_blur(&small, sigma * scale);
-    let b2 = fast_blur(&small, sigma * 4.0 * scale);
-    if debug {
-        eprintln!(
-            "xdog blurs: {} ms ({}x{} scale {scale:.2})",
-            t.elapsed().as_millis(),
-            w,
-            h
-        );
-    }
     let tau = 0.98f32;
     let phi = 20.0f32;
     // eps window is tight: interior DoG floor sits near +0.01, so eps must
     // stay negative; -0.15 keeps only the strongest edges, -0.008 everything.
     let eps = (-0.15 + 0.20 * strength.clamp(0.0, 1.0)).min(-0.008);
     let (swu, shu) = (sw as usize, sh as usize);
-    let (rb1, rb2) = (b1.as_raw(), b2.as_raw());
+    // Per-channel valleys: each channel is blurred at both sigmas, the
+    // soft-threshold response computed per channel, and the darkest (min)
+    // response wins each pixel. 6 small blurs instead of 2; fast_blur keeps
+    // the whole response stage in the tens of ms.
     let mut small_out = vec![255u8; swu * shu];
-    for (i, o) in small_out.iter_mut().enumerate() {
-        let d = rb1[i] as f32 / 255.0 - tau * rb2[i] as f32 / 255.0;
-        // XDoG soft threshold: values below eps become dark lines.
-        let v = if d >= eps {
-            1.0
-        } else {
-            1.0 + (phi * (d - eps)).tanh()
-        };
-        *o = (v.clamp(0.0, 1.0) * 255.0) as u8;
+    for ch in 0..3 {
+        let small = sample_channel(rgb, wu, hu, sw, sh, ch);
+        let b1 = fast_blur(&small, sigma * scale);
+        let b2 = fast_blur(&small, sigma * 4.0 * scale);
+        let (rb1, rb2) = (b1.as_raw(), b2.as_raw());
+        for (i, o) in small_out.iter_mut().enumerate() {
+            let d = rb1[i] as f32 / 255.0 - tau * rb2[i] as f32 / 255.0;
+            // XDoG soft threshold: values below eps become dark lines.
+            let v = if d >= eps {
+                1.0
+            } else {
+                1.0 + (phi * (d - eps)).tanh()
+            };
+            let v = (v.clamp(0.0, 1.0) * 255.0) as u8;
+            if v < *o {
+                *o = v;
+            }
+        }
     }
     // Hysteresis: confident lines seed, faint lines survive only when
     // connected to confident ones. Joins dotted seams, drops lone noise.
@@ -635,6 +749,11 @@ fn xdog_lines(lum: &[f32], w: u32, h: u32, strength: f32) -> XdogOut {
     let low = (225.0 + 10.0 * strength.clamp(0.0, 1.0)) as u8;
     let min_size = (30.0 - 20.0 * strength.clamp(0.0, 1.0)) as usize;
     let mut kept = hysteresis(&small_out, swu, shu, high, low);
+    sweep_small(&mut kept, swu, shu, min_size);
+    // Small filled details (buttons, eyelets, labels) thin to a dot and get
+    // swept, so they can never survive the skeleton path. Emit their outer
+    // boundary loops as closed chains instead.
+    let blobs = blob_outlines(&kept, swu, shu);
     sweep_small(&mut kept, swu, shu, min_size);
     // Close before thinning: joins dotted seams and 1-2px gaps into continuous
     // strokes (the old filled-blob pass got this from close_u8 r1). Without
@@ -655,7 +774,9 @@ fn xdog_lines(lum: &[f32], w: u32, h: u32, strength: f32) -> XdogOut {
     prune_spurs(&mut skel, swu, shu, 3);
     let mut chains = trace_chains(&skel, swu, shu);
     // Rejoin dotted-seam fragments split at junctions / small gaps.
-    merge_collinear(&mut chains, 4.0);
+    merge_collinear(&mut chains, 6.0);
+    // Closed blob loops never merge (their chord fit is huge); append after.
+    chains.extend(blobs);
     let chains = chains
         .into_iter()
         .filter(|c| c.len() >= 2)
@@ -850,10 +971,12 @@ fn trace_chains(skel: &[bool], w: usize, h: usize) -> Vec<Vec<(f32, f32)>> {
 
 /// Greedily merge chain ends that nearly touch and continue (near-)straight:
 /// thinning splits lines at every junction pixel, and staircase diagonals
-/// shatter into short fragments that turn sharply, so tangent alignment is
-/// the wrong test. Instead join the pair whose concatenation best fits its
-/// end-to-end chord (staircase fits a line; a collar V does not). Sharp
-/// corners stay split and rejoin visually via round caps.
+/// shatter into short fragments that turn sharply. Primary test: the
+/// concatenation must fit its end-to-end chord (staircase fits a line; a
+/// collar V does not). Curved lapel/seam fragments fail that test, so a
+/// secondary test accepts tangent-aligned joins (end directions agree within
+/// ~32 deg) with a looser chord bound. Sharp corners stay split and rejoin
+/// visually via round caps.
 fn merge_collinear(chains: &mut Vec<Vec<(f32, f32)>>, gap: f32) {
     /// Max perpendicular deviation of points from the end-to-end chord.
     fn chord_dev(pts: &[(f32, f32)]) -> f32 {
@@ -868,7 +991,35 @@ fn merge_collinear(chains: &mut Vec<Vec<(f32, f32)>>, gap: f32) {
             .map(|&(px, py)| (dy * px - dx * py + bx * ay - by * ax).abs() / den)
             .fold(0.0, f32::max)
     }
-    const FIT_TOL: f32 = 1.0;
+    const FIT_TOL: f32 = 1.5;
+    /// Looser chord bound for tangent-aligned joins (curved seams/lapels).
+    const CURVE_TOL: f32 = 3.0;
+    /// Long jumps (up to 3.5x gap) for gapped fold/stitch dashes: only when
+    /// nearly exactly collinear (dot > 0.92, dev <= 2.0). Greedy min-dev
+    /// selection still prefers true continuations over parallel-line rivals.
+    const LONG_REACH_MULT: f32 = 3.5;
+    const LONG_DOT: f32 = 0.92;
+    const LONG_DEV: f32 = 2.0;
+    /// Min cosine between the end directions at the join (~32 deg).
+    const TANGENT_DOT: f32 = 0.85;
+    /// Unit direction of the last/first `span` points at a chain end, in
+    /// oriented coords where the join sits at the tail / head respectively.
+    fn end_dir(pts: &[(f32, f32)], tail: bool) -> (f32, f32) {
+        let n = pts.len();
+        let k = (n - 1).clamp(1, 3);
+        let (ax, ay, bx, by) = if tail {
+            let (ax, ay) = pts[n - 1 - k];
+            let (bx, by) = pts[n - 1];
+            (ax, ay, bx, by)
+        } else {
+            let (ax, ay) = pts[0];
+            let (bx, by) = pts[k];
+            (ax, ay, bx, by)
+        };
+        let (dx, dy) = (bx - ax, by - ay);
+        let len = (dx * dx + dy * dy).sqrt().max(1e-6);
+        (dx / len, dy / len)
+    }
     loop {
         // (i, ie, j, je, dev), minimizing dev among ends within gap.
         let mut best: Option<(usize, bool, usize, bool, f32)> = None;
@@ -893,7 +1044,7 @@ fn merge_collinear(chains: &mut Vec<Vec<(f32, f32)>>, gap: f32) {
                             chains[j][0]
                         };
                         let dist = ((pi.0 - pj.0).powi(2) + (pi.1 - pj.1).powi(2)).sqrt();
-                        if dist > gap {
+                        if dist > gap * LONG_REACH_MULT {
                             continue;
                         }
                         // Orient i so the join is its tail, j so the join is
@@ -909,9 +1060,26 @@ fn merge_collinear(chains: &mut Vec<Vec<(f32, f32)>>, gap: f32) {
                             chains[j].clone()
                         };
                         let skip = usize::from(dist < 0.75);
+                        // Tangent fallback directions, measured at the
+                        // junction on the oriented halves: i arrives along
+                        // ti, j leaves along tj.
+                        let (tix, tiy) = end_dir(&cand, true);
+                        let (tjx, tjy) = end_dir(&other, false);
                         cand.extend(other.into_iter().skip(skip));
                         let dev = chord_dev(&cand);
-                        if dev <= FIT_TOL && best.map(|b| dev < b.4).unwrap_or(true) {
+                        // Aligned ends continue one curve: accept under a
+                        // looser chord bound for lapel/seam arcs, with a
+                        // longer reach for stitch pitch. The plain chord
+                        // test keeps the original tight gap.
+                        let aligned = tix * tjx + tiy * tjy > TANGENT_DOT && dev <= CURVE_TOL;
+                        let chord_ok = dist <= gap && dev <= FIT_TOL;
+                        // Long jump across a response gap: near-exact
+                        // collinearity only; min-dev ordering still serves
+                        // true continuations first.
+                        let long_ok = tix * tjx + tiy * tjy > LONG_DOT && dev <= LONG_DEV;
+                        if (chord_ok || aligned || long_ok)
+                            && best.map(|b| dev < b.4).unwrap_or(true)
+                        {
                             best = Some((i, ie, j, je, dev));
                         }
                     }
@@ -939,6 +1107,171 @@ fn merge_collinear(chains: &mut Vec<Vec<(f32, f32)>>, gap: f32) {
         chains.remove(j);
     }
     chains.retain(|c| c.len() >= 2);
+}
+
+/// Outer boundary loops of small compact response components, in small-px
+/// coords (closed: first point repeated at the end). Thin seam fragments are
+/// excluded by the min-side gate; large regions by the max-side gate; wisps
+/// by the solidity gate. Units are small-px so the gates behave the same at
+/// any input resolution.
+fn blob_outlines(kept: &[bool], w: usize, h: usize) -> Vec<Vec<(f32, f32)>> {
+    let (labels, comps) = label_components(kept, w, h);
+    let mut out = Vec::new();
+    for (id, c) in comps.iter().enumerate().skip(1) {
+        let (bw, bh) = (c.x1 - c.x0, c.y1 - c.y0);
+        let bbox = (bw * bh).max(1);
+        if c.area < 24 || bw.min(bh) < 6 || bw.max(bh) > 64 {
+            continue;
+        }
+        if c.area * 100 < bbox * 45 {
+            continue;
+        }
+        let boundary = moore_outline(&labels, id as u32, c, w, h);
+        if boundary.len() >= 4 {
+            // Buttons trace as ragged loops; a clean fitted circle reads as
+            // a tech-pack button, while non-circular blobs keep their shape.
+            out.push(fit_circle_or(boundary));
+        }
+    }
+    out
+}
+
+/// Kasa circle fit on a closed boundary loop: when the loop is circular
+/// (radial RMSE < 12% of radius, near-square bbox) replace the ragged trace
+/// with a clean 14-gon; otherwise return the loop unchanged.
+fn fit_circle_or(loop_pts: Vec<(f32, f32)>) -> Vec<(f32, f32)> {
+    // Drop the closing duplicate for the fit.
+    let pts = if loop_pts.len() > 2 {
+        &loop_pts[..loop_pts.len() - 1]
+    } else {
+        return loop_pts;
+    };
+    let n = pts.len() as f32;
+    let (mx, my) = (
+        pts.iter().map(|p| p.0).sum::<f32>() / n,
+        pts.iter().map(|p| p.1).sum::<f32>() / n,
+    );
+    // Kasa fit: solve [suu suv; suv svv] [uc;vc] = rhs/2 for the center.
+    let (mut suu, mut suv, mut svv) = (0.0f32, 0.0f32, 0.0f32);
+    let (mut bx, mut by) = (0.0f32, 0.0f32);
+    for &(px, py) in pts {
+        let (u, v) = (px - mx, py - my);
+        suu += u * u;
+        suv += u * v;
+        svv += v * v;
+        let r2 = u * u + v * v;
+        bx += u * r2;
+        by += v * r2;
+    }
+    let det = suu * svv - suv * suv;
+    if det.abs() < 1e-6 {
+        return loop_pts;
+    }
+    let (uc, vc) = (
+        (bx * svv - by * suv) / det / 2.0,
+        (suu * by - suv * bx) / det / 2.0,
+    );
+    let (cx, cy) = (uc + mx, vc + my);
+    let r = pts
+        .iter()
+        .map(|&(px, py)| ((px - cx).powi(2) + (py - cy).powi(2)).sqrt())
+        .sum::<f32>()
+        / n;
+    if r < 2.0 {
+        return loop_pts;
+    }
+    let rmse = (pts
+        .iter()
+        .map(|&(px, py)| (((px - cx).powi(2) + (py - cy).powi(2)).sqrt() - r).powi(2))
+        .sum::<f32>()
+        / n)
+        .sqrt();
+    let (mut x0, mut y0, mut x1, mut y1) = (f32::MAX, f32::MAX, f32::MIN, f32::MIN);
+    for &(px, py) in pts {
+        x0 = x0.min(px);
+        y0 = y0.min(py);
+        x1 = x1.max(px);
+        y1 = y1.max(py);
+    }
+    let (bw, bh) = (x1 - x0 + 1.0, y1 - y0 + 1.0);
+    if rmse / r > 0.12 || (bw / bh - 1.0).abs() > 0.35 {
+        return loop_pts;
+    }
+    // Clean 14-gon, closed.
+    let mut poly: Vec<(f32, f32)> = (0..14)
+        .map(|k| {
+            let a = k as f32 * std::f32::consts::TAU / 14.0;
+            (cx + r * a.cos(), cy + r * a.sin())
+        })
+        .collect();
+    poly.push((cx + r, cy));
+    poly
+}
+/// Moore-neighbor outer boundary trace of one 4-connected component
+/// (Jacob's stopping criterion). Returns a closed loop in pixel coords.
+fn moore_outline(labels: &[u32], id: u32, c: &Component, w: usize, h: usize) -> Vec<(f32, f32)> {
+    // Clockwise neighbor order for y-down images, starting index included.
+    const DX: [i32; 8] = [-1, -1, 0, 1, 1, 1, 0, -1]; // W NW N NE E SE S SW
+    const DY: [i32; 8] = [0, -1, -1, -1, 0, 1, 1, 1];
+    let at = |x: i32, y: i32| -> bool {
+        x >= c.x0 as i32
+            && y >= c.y0 as i32
+            && x < c.x1 as i32
+            && y < c.y1 as i32
+            && x >= 0
+            && y >= 0
+            && (x as usize) < w
+            && (y as usize) < h
+            && labels[y as usize * w + x as usize] == id
+    };
+    // Start at the leftmost pixel of the topmost row: the pixel above it is
+    // background, so backtrack-from-north is valid.
+    let (mut sx, sy) = (c.x1, c.y0);
+    for x in c.x0..c.x1 {
+        if at(x as i32, sy as i32) {
+            sx = x;
+            break;
+        }
+    }
+    if sx == c.x1 {
+        return Vec::new();
+    }
+    let (sx, sy) = (sx as i32, sy as i32);
+    let mut boundary = vec![(sx as f32, sy as f32)];
+    // Backtrack direction: north of start (background by construction).
+    let (mut cx, mut cy) = (sx, sy);
+    // Direction index of `backtrack` as seen from `current`.
+    let mut back_dir = 2; // N
+    let (mut fx, mut fy) = (sx, sy);
+    let mut first = true;
+    loop {
+        // Scan clockwise starting with the neighbor after backtrack.
+        let mut stepped = false;
+        for k in 1..=8 {
+            let dir = (back_dir + k) % 8;
+            let (nx, ny) = (cx + DX[dir], cy + DY[dir]);
+            if at(nx, ny) {
+                if first {
+                    (fx, fy) = (nx, ny);
+                    first = false;
+                } else if cx == sx && cy == sy && nx == fx && ny == fy {
+                    // Re-entered start via the first step: loop closed.
+                    boundary.push((sx as f32, sy as f32));
+                    return boundary;
+                }
+                (cx, cy) = (nx, ny);
+                back_dir = (dir + 4) % 8;
+                boundary.push((cx as f32, cy as f32));
+                stepped = true;
+                break;
+            }
+        }
+        if !stepped || boundary.len() > c.area * 4 + 16 {
+            // Isolated pixel (no fg neighbor) or runaway: close what we have.
+            boundary.push((sx as f32, sy as f32));
+            return boundary;
+        }
+    }
 }
 
 /// Polyline arc length in chain (small-px) units.
@@ -1113,11 +1446,14 @@ fn sweep_small(kept: &mut [bool], w: usize, h: usize, min_size: usize) {
     }
 }
 
-/// Nearest-sample a u8 gray image straight from the float luminance buffer.
-fn sample_gray(lum: &[f32], w: usize, h: usize, sw: u32, sh: u32) -> GrayImage {
+/// Box-average one R/G/B channel straight from the RGB image down to small
+/// size (box average, not nearest point: nearest sampling aliases the edge
+/// phase row-to-row, which dithers the threshold into dotted lines).
+fn sample_channel(rgb: &RgbImage, w: usize, h: usize, sw: u32, sh: u32, ch: usize) -> GrayImage {
     // Box-average (not nearest point): nearest sampling aliases the edge
     // phase row-to-row, which dithers the threshold into dotted lines.
     let (sw, sh) = (sw as usize, sh as usize);
+    let raw_px = rgb.as_raw();
     let mut raw = vec![0u8; sw * sh];
     for y in 0..sh {
         let y0 = y * h / sh;
@@ -1125,18 +1461,18 @@ fn sample_gray(lum: &[f32], w: usize, h: usize, sw: u32, sh: u32) -> GrayImage {
         for x in 0..sw {
             let x0 = x * w / sw;
             let x1 = ((x + 1) * w / sw).max(x0 + 1);
-            let mut acc = 0.0f32;
+            let mut acc = 0u32;
             let mut n = 0u32;
             for sy in y0..y1 {
                 for sx in x0..x1 {
-                    acc += lum[sy * w + sx];
+                    acc += raw_px[(sy * w + sx) * 3 + ch] as u32;
                     n += 1;
                 }
             }
-            raw[y * sw + x] = ((acc / n as f32).clamp(0.0, 1.0) * 255.0) as u8;
+            raw[y * sw + x] = (acc / n) as u8;
         }
     }
-    GrayImage::from_raw(sw as u32, sh as u32, raw).expect("small gray")
+    GrayImage::from_raw(sw as u32, sh as u32, raw).expect("small channel")
 }
 
 /// Nearest-upscale a u8 buffer (fast path around the slow generic resize).
@@ -1246,22 +1582,63 @@ mod tests {
     }
 
     #[test]
-    fn symmetrize_is_mirror_exact() {
+    fn symmetrize_mirrors_each_view_in_its_own_box() {
+        // Near-symmetric view: 4x2 block + one extra pixel mirrors the pixel
+        // across and reports symmetrized.
         let (w, h) = (9usize, 4usize);
         let mut m = vec![false; w * h];
-        m[0] = true; // asymmetric speck, top-left
-        m[2 * w + 6] = true;
-        symmetrize_mask(&mut m, w as u32, h as u32);
-        for y in 0..h {
-            for x in 0..w {
-                assert_eq!(
-                    m[y * w + x],
-                    m[y * w + (w - 1 - x)],
-                    "mirror mismatch at {x},{y}"
-                );
+        for y in 1..3 {
+            for x in 2..6 {
+                m[y * w + x] = true;
             }
         }
-        assert!(m[8], "speck mirrored to top-right");
+        m[3 * w + 2] = true;
+        let (labels, mut comps) = label_components(&m, w, h);
+        assert_eq!(comps.len(), 2, "one view");
+        symmetrize_components(&mut m, &labels, &mut comps, w, h);
+        assert!(comps[1].symmetrized, "near-symmetric view averaged");
+        assert!(m[3 * w + 5], "extra pixel mirrored within its own box");
+        assert!(!m[3 * w + 8], "mirror never leaves the view's box");
+    }
+
+    #[test]
+    fn symmetrize_leaves_side_views_untouched() {
+        // L shape (side-profile-like): mirroring the bar would grow the area
+        // ~58%, so the view must pass through unchanged.
+        let (w, h) = (9usize, 8usize);
+        let mut m = vec![false; w * h];
+        for y in 0..8 {
+            m[y * w + 2] = true;
+        }
+        for x in 2..7 {
+            m[7 * w + x] = true;
+        }
+        let before = m.clone();
+        let (labels, mut comps) = label_components(&m, w, h);
+        symmetrize_components(&mut m, &labels, &mut comps, w, h);
+        assert!(!comps[1].symmetrized, "asymmetric view flagged");
+        assert_eq!(m, before, "asymmetric view untouched");
+    }
+
+    #[test]
+    fn sweep_keeps_every_view_drops_specks() {
+        // Two garment views + one speck: both views survive, speck goes.
+        let (w, h) = (30usize, 10usize);
+        let mut m = vec![false; w * h];
+        for y in 2..7 {
+            for x in 2..7 {
+                m[y * w + x] = true;
+            }
+            for x in 20..25 {
+                m[y * w + x] = true;
+            }
+        }
+        m[0] = true;
+        sweep_small_components(&mut m, w, h, 10);
+        let n: usize = m.iter().filter(|&&b| b).count();
+        assert_eq!(n, 50, "both views kept, speck dropped, got {n}");
+        let (_, comps) = label_components(&m, w, h);
+        assert_eq!(comps.len(), 3, "two views labelled");
     }
 
     #[test]
@@ -1311,6 +1688,60 @@ mod tests {
         m[0] = true;
         let s = smooth_mask(&m, 30, 30, 2);
         assert_eq!(s.iter().filter(|&&b| b).count(), 400);
+    }
+
+    #[test]
+    fn xdog_catches_isoluminant_chroma_edges() {
+        // Gold-on-denim button: chroma step with a near-flat luminance field
+        // (luminance-only XDoG is blind to it). Denim [70,100,170] lum=0.387,
+        // button [150,90,40] lum=0.389: |dLum| < 0.01, but R jumps +80 and
+        // B drops -130 across the rim.
+        let (w, h) = (120u32, 140u32);
+        let mut img = RgbImage::from_pixel(w, h, Rgb([255, 255, 255]));
+        let denim = Rgb([70, 100, 170]);
+        let gold = Rgb([150, 90, 40]);
+        for y in 40..120 {
+            for x in 30..90 {
+                img.put_pixel(x, y, denim);
+            }
+        }
+        for y in 65..95 {
+            for x in 45..75 {
+                let dx = x as i32 - 60;
+                let dy = y as i32 - 80;
+                if dx * dx + dy * dy <= 100 {
+                    img.put_pixel(x, y, gold);
+                }
+            }
+        }
+        let lum: Vec<f32> = img
+            .pixels()
+            .map(|p| (0.2126 * p[0] as f32 + 0.7152 * p[1] as f32 + 0.0722 * p[2] as f32) / 255.0)
+            .collect();
+        let (mut lo, mut hi) = (1.0f32, 0.0f32);
+        for y in 65..95 {
+            for x in 45..75 {
+                let v = lum[(y * w + x) as usize];
+                lo = lo.min(v);
+                hi = hi.max(v);
+            }
+        }
+        assert!(
+            hi - lo < 0.02,
+            "test field must be isoluminant, got {lo:.3}..{hi:.3}"
+        );
+        let xd = xdog_lines(&img, 0.6);
+        let near = xd
+            .chains
+            .iter()
+            .filter(|c| {
+                !c.is_empty()
+                    && c.iter().any(|&(px, py)| {
+                        (40.0..=80.0).contains(&px) && (60.0..=100.0).contains(&py)
+                    })
+            })
+            .count();
+        assert!(near > 0, "button rim must produce linework");
     }
 
     #[test]
@@ -1422,6 +1853,37 @@ mod tests {
             "V corner stays split, got {}",
             corner.len()
         );
+    }
+
+    #[test]
+    fn tangent_arc_fragments_merge() {
+        // Two fragments of a r=20 arc (5 deg steps). Combined chord dev is
+        // ~1.9, above FIT_TOL, but end tangents agree (~15 deg apart), so the
+        // fallback must join them into one lapel-like curve.
+        let mut chains = vec![
+            vec![
+                (20.000, 0.000),
+                (19.924, 1.743),
+                (19.696, 3.473),
+                (19.319, 5.176),
+                (18.794, 6.840),
+            ],
+            vec![
+                (17.321, 10.000),
+                (16.383, 11.471),
+                (15.321, 12.856),
+                (14.142, 14.142),
+                (12.856, 15.321),
+            ],
+        ];
+        merge_collinear(&mut chains, 6.0);
+        assert_eq!(
+            chains.len(),
+            1,
+            "arc joins via tangents, got {}",
+            chains.len()
+        );
+        assert_eq!(chains[0].len(), 10);
     }
 
     #[test]
