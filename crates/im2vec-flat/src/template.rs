@@ -318,6 +318,61 @@ pub fn pocket_template(w: f32, h: f32) -> Template {
     }
 }
 
+/// Front view: collar band between the lapel notches. The target draws it as
+/// a flat band with a topstitched fall edge and a small center label/hanger.
+/// `vg` is the gorge (notch) row from the detector; photo measurement shows
+/// the actual notch 22px above the detector's y, so we apply that correction.
+/// The collar stands 29px above the corrected notch (photo-measured).
+/// Spans +/-0.14w to meet the lapel notches exactly.
+pub fn front_collar_template(vg: f32) -> Template {
+    // Photo evidence (pipeline coords): notch y=156, top y=127.
+    // Detector vg maps to y=178; correct by -22px, height 29px.
+    // With h~740: 22/740=0.030, 29/740=0.039.
+    let vg_corr = vg - 0.030;
+    let v_top = vg_corr - 0.039;
+    let hw = 0.14f32;
+    Template {
+        name: "front-collar",
+        paths: vec![
+            // Collar fall (top edge), slight upward arc at center.
+            TPath::solid(vec![
+                TPoint::Norm(-hw, v_top + 0.004),
+                TPoint::Norm(0.0, v_top),
+                TPoint::Norm(hw, v_top + 0.004),
+            ]),
+            // Collar bottom (neckline seam) — meets the gorge seam.
+            TPath::solid(vec![
+                TPoint::Norm(-hw, vg_corr),
+                TPoint::Norm(0.0, vg_corr - 0.004),
+                TPoint::Norm(hw, vg_corr),
+            ]),
+            // Collar ends (at the notches).
+            TPath::solid(vec![
+                TPoint::Norm(-hw, v_top + 0.004),
+                TPoint::Norm(-hw, vg_corr),
+            ]),
+            TPath::solid(vec![
+                TPoint::Norm(hw, v_top + 0.004),
+                TPoint::Norm(hw, vg_corr),
+            ]),
+            // Dashed topstitching below the fall edge.
+            TPath::dashed(vec![
+                TPoint::NormPx(-hw, v_top + 0.004, 3.0, 5.0),
+                TPoint::NormPx(0.0, v_top, 0.0, 5.0),
+                TPoint::NormPx(hw, v_top + 0.004, -3.0, 5.0),
+            ]),
+            // Center label/hanger: small rect on the neckline.
+            TPath::solid(vec![
+                TPoint::NormPx(-0.025, vg_corr - 0.004, 0.0, -2.0),
+                TPoint::NormPx(0.025, vg_corr - 0.004, 0.0, -2.0),
+                TPoint::NormPx(0.025, vg_corr - 0.004, 0.0, 6.0),
+                TPoint::NormPx(-0.025, vg_corr - 0.004, 0.0, 6.0),
+                TPoint::NormPx(-0.025, vg_corr - 0.004, 0.0, -2.0),
+            ]),
+        ],
+    }
+}
+
 /// Back view: collar band (top/bottom edges + sides), dashed topstitching
 /// along the collar bottom, and the dashed center back seam.
 pub fn back_collar_template() -> Template {
