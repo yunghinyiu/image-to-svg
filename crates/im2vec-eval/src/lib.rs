@@ -26,18 +26,6 @@ use std::collections::HashMap;
 
 /// Max side (px) of every canvas metrics are computed on.
 pub const EVAL_MAX_SIDE: u32 = 1024;
-
-/// Ink thresholds for the native-resolution ratio (#18). The 1024px eval
-/// canvas downscales the target with bilinear filtering, blurring its 2px
-/// lines into a gray gradient (median ~147) with no fair threshold — so the
-/// ink *ratio* is counted on the crisp native renders instead. The target's
-/// antialiased lines need 128 to avoid counting the halo; our crisp resvg
-/// render needs 200 to catch all ink. (The 1024px masks keep their 128/200
-/// thresholds for chamfer point positions.)
-/// Native-res ink threshold for the target PNG (#18).
-pub const INK_THRESH_TARGET_NATIVE: u8 = 128;
-/// Native-res ink threshold for our SVG render (#18).
-pub const INK_THRESH_OURS_NATIVE: u8 = 200;
 /// Max ink points sampled per side for Chamfer.
 pub const CHAMFER_MAX_POINTS: usize = 20_000;
 
@@ -231,194 +219,6 @@ pub fn warp_mask_nearest(src: &GrayImage, sim: &Similarity, dw: u32, dh: u32) ->
         };
         Luma([v])
     })
-}
-
-// ---------------------------------------------------------------------------
-// per-view silhouette IoU (Phase 2)
-// ---------------------------------------------------------------------------
-
-/// A garment view's bounding box: (x0, y0, x1, y1) with x1/y1 exclusive.
-pub type ViewBox = (u32, u32, u32, u32);
-
-/// 4-connected components of a binary mask (pixel > 128), each as a
-/// bounding box. Components smaller than `min_area` are dropped.
-fn components_of(mask: &GrayImage, min_area: usize) -> Vec<ViewBox> {
-    let (w, h) = (mask.width() as usize, mask.height() as usize);
-    let mut labels = vec![0u32; w * h];
-    let mut boxes: Vec<(u32, u32, u32, u32, usize)> = Vec::new();
-    let mut next = 1u32;
-    for y in 0..h {
-        for x in 0..w {
-            let i = y * w + x;
-            if mask.get_pixel(x as u32, y as u32)[0] <= 128 || labels[i] != 0 {
-                continue;
-            }
-            let mut stack = vec![(x, y)];
-            labels[i] = next;
-            let (mut x0, mut y0, mut x1, mut y1) = (x, y, x + 1, y + 1);
-            let mut area = 0usize;
-            while let Some((cx, cy)) = stack.pop() {
-                area += 1;
-                x0 = x0.min(cx);
-                y0 = y0.min(cy);
-                x1 = x1.max(cx + 1);
-                y1 = y1.max(cy + 1);
-                for (nx, ny) in [
-                    (cx + 1, cy),
-                    (cx.wrapping_sub(1), cy),
-                    (cx, cy + 1),
-                    (cx, cy.wrapping_sub(1)),
-                ] {
-                    if nx < w && ny < h {
-                        let j = ny * w + nx;
-                        if labels[j] == 0 && mask.get_pixel(nx as u32, ny as u32)[0] > 128 {
-                            labels[j] = next;
-                            stack.push((nx, ny));
-                        }
-                    }
-                }
-            }
-            if area >= min_area {
-                boxes.push((x0 as u32, y0 as u32, x1 as u32, y1 as u32, area));
-            }
-            next += 1;
-        }
-    }
-    boxes
-        .into_iter()
-        .map(|(x0, y0, x1, y1, _)| (x0, y0, x1, y1))
-        .collect()
-}
-
-/// Merge horizontally overlapping boxes (a cuff blob touching its sleeve is
-/// one view, not two). Returns boxes sorted left-to-right.
-pub fn per_view_boxes(mask: &GrayImage, min_area: usize) -> Vec<ViewBox> {
-    let mut boxes = components_of(mask, min_area);
-    boxes.sort_by_key(|b| b.0);
-    let mut merged: Vec<ViewBox> = Vec::new();
-    for b in boxes {
-        if let Some(m) = merged.last_mut() {
-            // overlap in x and vertical overlap: same view
-            if b.0 < m.2 && b.2 > m.0 && b.1 < m.3 && b.3 > m.1 {
-                m.0 = m.0.min(b.0);
-                m.1 = m.1.min(b.1);
-                m.2 = m.2.max(b.2);
-                m.3 = m.3.max(b.3);
-                continue;
-            }
-        }
-        merged.push(b);
-    }
-    merged
-}
-
-/// Anisotropic (independent x/y scale + translation) bbox alignment.
-pub struct AnisoSimilarity {
-    pub sx: f32,
-    pub sy: f32,
-    pub tx: f32,
-    pub ty: f32,
-}
-
-pub fn align_bboxes_aniso(our_bb: ViewBox, tgt_bb: ViewBox) -> AnisoSimilarity {
-    let (ox0, oy0, ox1, oy1) = (
-        our_bb.0 as f32,
-        our_bb.1 as f32,
-        our_bb.2 as f32,
-        our_bb.3 as f32,
-    );
-    let (tx0, ty0, tx1, ty1) = (
-        tgt_bb.0 as f32,
-        tgt_bb.1 as f32,
-        tgt_bb.2 as f32,
-        tgt_bb.3 as f32,
-    );
-    let ow = (ox1 - ox0).max(1.0);
-    let oh = (oy1 - oy0).max(1.0);
-    let sx = (tx1 - tx0).max(1.0) / ow;
-    let sy = (ty1 - ty0).max(1.0) / oh;
-    let (ocx, ocy) = ((ox0 + ox1) / 2.0, (oy0 + oy1) / 2.0);
-    let (tcx, tcy) = ((tx0 + tx1) / 2.0, (ty0 + ty1) / 2.0);
-    AnisoSimilarity {
-        sx,
-        sy,
-        tx: tcx - sx * ocx,
-        ty: tcy - sy * ocy,
-    }
-}
-
-/// Warp a binary mask with nearest-neighbour through an anisotropic transform.
-pub fn warp_mask_nearest_aniso(
-    src: &GrayImage,
-    sim: &AnisoSimilarity,
-    dw: u32,
-    dh: u32,
-) -> GrayImage {
-    GrayImage::from_fn(dw, dh, |x, y| {
-        let sx = (x as f32 - sim.tx) / sim.sx;
-        let sy = (y as f32 - sim.ty) / sim.sy;
-        let v = if sx >= 0.0 && sy >= 0.0 {
-            let (ix, iy) = (sx as u32, sy as u32);
-            if ix < src.width() && iy < src.height() {
-                src.get_pixel(ix, iy)[0]
-            } else {
-                0
-            }
-        } else {
-            0
-        };
-        Luma([v])
-    })
-}
-
-/// Per-view silhouette IoU result.
-pub struct PerViewIou {
-    pub our_box: ViewBox,
-    pub target_box: ViewBox,
-    /// IoU under uniform (similarity) per-view alignment.
-    pub iou_uniform: f64,
-    /// IoU under anisotropic (independent x/y scale) per-view alignment.
-    /// This isolates mask *shape* accuracy from the inherent photo-vs-redrawing
-    /// proportion gap, which the mask pipeline cannot control.
-    pub iou_aniso: f64,
-    pub aniso_sx: f32,
-    pub aniso_sy: f32,
-}
-
-/// Per-view silhouette IoU: split both masks into left-to-right views, align
-/// each of our views to the corresponding target view, and compute IoU.
-/// Views are paired by left-to-right order.
-pub fn per_view_silhouette_iou(ours: &GrayImage, target: &GrayImage) -> Vec<PerViewIou> {
-    let our_views = per_view_boxes(ours, 500);
-    let tgt_views = per_view_boxes(target, 500);
-    let n = our_views.len().min(tgt_views.len());
-    let (w, h) = (target.width(), target.height());
-    let margin = 20u32;
-    (0..n)
-        .map(|k| {
-            let (ob, tb) = (our_views[k], tgt_views[k]);
-            let sim = align_bboxes(ob, tb);
-            let warped = warp_mask_nearest(ours, &sim, w, h);
-            let asim = align_bboxes_aniso(ob, tb);
-            let warped_a = warp_mask_nearest_aniso(ours, &asim, w, h);
-            let (x0, y0, x1, y1) = tb;
-            let cx0 = x0.saturating_sub(margin);
-            let cy0 = y0.saturating_sub(margin);
-            let cx1 = (x1 + margin).min(w);
-            let cy1 = (y1 + margin).min(h);
-            let crop = |m: &GrayImage| {
-                GrayImage::from_fn(cx1 - cx0, cy1 - cy0, |x, y| *m.get_pixel(cx0 + x, cy0 + y))
-            };
-            PerViewIou {
-                our_box: ob,
-                target_box: tb,
-                iou_uniform: iou(&crop(&warped), &crop(target)),
-                iou_aniso: iou(&crop(&warped_a), &crop(target)),
-                aniso_sx: asim.sx,
-                aniso_sy: asim.sy,
-            }
-        })
-        .collect()
 }
 
 // ---------------------------------------------------------------------------
@@ -750,8 +550,7 @@ pub struct EvalArtifacts {
     pub onion_png: Vec<u8>,
 }
 
-/// Resize so the max side is `max_side` (no-op if already smaller).
-pub fn resize_max_side(
+fn resize_max_side(
     gray: &GrayImage,
     max_side: u32,
     filter: image::imageops::FilterType,
@@ -798,8 +597,7 @@ pub fn run_eval(input_png: &[u8], target_png: &[u8], opts: &FlatOptions) -> Resu
     let target_ink = ink_mask(&target, 128);
     let target_sil = silhouette_from_lineart(&target);
     let target_pts = sample_points(&target_ink, CHAMFER_MAX_POINTS);
-    // Note: ink *counts* for the ratio come from the native-res renders
-    // below (#18); the 1024px mask is only for chamfer point positions.
+    let target_ink_n = target_ink.pixels().filter(|p| p[0] > 0).count();
 
     // 3. our output on the eval canvas
     let ours_rgba = rasterize_svg(&flat.svg, EVAL_MAX_SIDE)?;
@@ -807,7 +605,7 @@ pub fn run_eval(input_png: &[u8], target_png: &[u8], opts: &FlatOptions) -> Resu
     let ours_gray: GrayImage = image::imageops::grayscale(&ours_rgba);
     let ours_ink = ink_mask(&ours_gray, 200);
     let ours_pts = sample_points(&ours_ink, CHAMFER_MAX_POINTS);
-    // (ink count for the ratio: see native-res below)
+    let ours_ink_n = ours_ink.pixels().filter(|p| p[0] > 0).count();
     let ours_mask = image::imageops::resize(&mask_full, ow, oh, FilterType::Nearest);
     anyhow::ensure!(
         mask_full.width() == sw && mask_full.height() == sh,
@@ -837,17 +635,6 @@ pub fn run_eval(input_png: &[u8], target_png: &[u8], opts: &FlatOptions) -> Resu
     let (nw, _nh) = (ours_native_rgba.width(), ours_native_rgba.height());
     let ours_gray_native: GrayImage = image::imageops::grayscale(&ours_native_rgba);
     let ours_ink_native = ink_mask(&ours_gray_native, 200);
-    // Ink ratio at native resolution (#18): count crisp ink pixels with the
-    // evidence-backed thresholds (target 128, ours 200). (Button masks above
-    // keep their tuned thresholds; this is only the ratio.)
-    let target_ink_n = target_full
-        .pixels()
-        .filter(|p| p[0] < INK_THRESH_TARGET_NATIVE)
-        .count();
-    let ours_ink_n = ours_gray_native
-        .pixels()
-        .filter(|p| p[0] < INK_THRESH_OURS_NATIVE)
-        .count();
     let scale_t = tw as f32 / target_full.width() as f32;
     let scale_o = ow as f32 / nw as f32;
     let target_blobs: Vec<Blob> = detect_blobs(&target_ink_native, 40, 9000, 0.55)
