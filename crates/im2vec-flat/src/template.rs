@@ -156,9 +156,6 @@ pub fn render_template(t: &Template, p: &Placement) -> Vec<RenderedPath> {
 }
 
 /// Sample a cubic Bezier in (u, v) template space into `n` segments.
-/// (Currently unused outside its test after the straight-edge lapel rework;
-/// kept for future curved template edges.)
-#[allow(dead_code)]
 fn sample_cubic_uv(
     p0: (f32, f32),
     p1: (f32, f32),
@@ -218,70 +215,55 @@ fn rounded_rect_uv(
 /// height (from button detection). Proportions transcribed from the
 /// reference tech pack: notch at 0.14w, peak at 0.25w / 0.24h, break at
 /// 0.09w; dashed topstitching inset 9px; roll line from neck to button.
-pub fn lapel_template(vg: f32, _vb: f32) -> Template {
-    // Scale down: use compact vb (not detector's tall vb).
-    // Target lapel is ~0.15h tall, not 0.32h.
-    // Peak at 0.26 (further out than notch_outer 0.16) for the jut.
-    let vb_compact = vg + 0.15f32;
-    lapel_template_with_peak(vg, vb_compact, 0.26f32)
-}
-
-/// Lapel template with explicit peak x position (for curvature-snapped placement).
-/// `peak_x` is the normalized x offset from center (0.30 = wide angular lapel).
-pub fn lapel_template_with_peak(vg: f32, _vb: f32, peak_x: f32) -> Template {
-    // Notched lapel geometry (target-measured):
-    // - Gorge: where collar meets lapel at center front
-    // - Notch: V-shaped cutout between collar and lapel (the "step")
-    // - Peak: outermost point, juts OUTWARD from the notch
-    // - Break: where lapel meets the front edge at button level
-    //
-    // The target shows a distinct notch step, not a smooth V. The peak
-    // points outward (horizontally), not downward.
-    // Notched lapel with SHARP BREAK at collar-lapel junction (Jev conf 1.0).
-    // The break is a distinct angular corner where the collar ends and the
-    // lapel begins. The lapel's top edge is STRAIGHT from break to peak.
-    // Target shows a pronounced step, not a subtle one.
-    // PEAK MUST BE FURTHER OUT than notch_outer to create the jut.
-    let break_pt = (0.08f32, vg); // BREAK: collar ends here
-                                  // Notch: HORIZONTAL step outward (same Y as break for sharp 90° corner).
-    let notch_outer = (0.16f32, vg); // Step outward, NO vertical drop
-                                     // Peak: widest point, just below notch (shallow top edge).
-    let peak = (peak_x, vg + 0.073f32); // Peak: target (0.250,0.244), vg=0.171
-    let brk = (0.10f32, vg + 0.244f32); // Bottom: measured (0.107,0.415)
-                                        // (Old cubic curve rendered a rounded shield; removed per target.)
+pub fn lapel_template(vg: f32, vb: f32) -> Template {
+    let notch = (0.14f32, vg);
+    let peak = (0.25f32, 0.24f32);
+    let brk = (0.09f32, vb);
+    // Peak -> break gentle curve, cubic control points (transcribed).
+    let c1 = (peak.0, peak.1 + (brk.1 - peak.1) * 0.35);
+    let c2 = (
+        peak.0 + (brk.0 - peak.0) * 0.3,
+        brk.1 - (brk.1 - peak.1) * 0.25,
+    );
+    // Roll line: the V from neck to button.
+    let roll = vec![
+        TPoint::Norm(0.14 * 0.55, 0.06 + 0.01),
+        TPoint::Norm(0.14 * 0.42, (0.06 + vb) * 0.5),
+        TPoint::NormPx(0.09 * 0.5, vb, 0.0, -4.0),
+    ];
     Template {
         name: "lapel",
         paths: vec![
-            // BREAK: sharp corner where collar ends, lapel begins.
-            // Horizontal step outward (pronounced, not subtle).
+            // Outer edge: notch -> peak (straight).
             TPath::solid(vec![
-                TPoint::Norm(break_pt.0, break_pt.1),
-                TPoint::Norm(notch_outer.0, notch_outer.1),
-            ]),
-            // Lapel top edge: STRAIGHT (target has crisp tailored edges, not curves).
-            TPath::solid(vec![
-                TPoint::Norm(notch_outer.0, notch_outer.1),
+                TPoint::Norm(notch.0, notch.1),
                 TPoint::Norm(peak.0, peak.1),
             ]),
-            // Lapel outer edge: STRAIGHT (crisp, per target).
-            TPath::solid(vec![
-                TPoint::Norm(peak.0, peak.1),
-                TPoint::Norm(brk.0, brk.1),
-            ]),
-            // Dashed topstitching parallel to straight lapel edges, inset 9px.
+            // Outer edge: peak -> break (curve). Sharp corner at the peak
+            // for the notch-lapel point.
+            TPath::solid(sample_cubic_uv(peak, c1, c2, brk, 16)),
+            // Dashed topstitching parallel to the outer edge, inset 9px.
             TPath::dashed(vec![
-                TPoint::NormPx(notch_outer.0, notch_outer.1, -9.0, 2.0),
+                TPoint::NormPx(notch.0, notch.1, -9.0, 2.0),
                 TPoint::NormPx(peak.0, peak.1, -9.0, 0.0),
             ]),
-            TPath::dashed(vec![
-                TPoint::NormPx(peak.0, peak.1, -9.0, 0.0),
-                TPoint::NormPx(brk.0, brk.1, -9.0, 0.0),
-            ]),
-            // Roll line: break -> brk (the V opening, straight).
-            TPath::solid(vec![
-                TPoint::Norm(break_pt.0, break_pt.1),
-                TPoint::Norm(brk.0, brk.1),
-            ]),
+            TPath::dashed(
+                sample_cubic_uv(
+                    (peak.0, peak.1),
+                    (c1.0, c1.1),
+                    (c2.0, c2.1),
+                    (brk.0, brk.1),
+                    16,
+                )
+                .into_iter()
+                .map(|tp| match tp {
+                    TPoint::Norm(u, v) => TPoint::NormPx(u, v, -9.0, 0.0),
+                    other => other,
+                })
+                .collect(),
+            ),
+            // Roll line.
+            TPath::solid(roll),
         ],
     }
 }
@@ -299,134 +281,63 @@ pub fn gorge_seam_template(vg: f32) -> Template {
     }
 }
 
-/// Pocket flap: rounded rect + dashed inset topstitching, anchored at the frame
-/// `(ax, ay)` = `(pocket_center_x, pocket_bottom_y)`.
-///
-/// Bottom-anchored because the detector (`detect::detect_pocket_y`) keys on the
-/// flap's strong bottom edge — the underlay check (photo underneath, trace from
-/// it) showed a top-anchored placement draws the flap one flap-height too low.
+/// Pocket flap: rounded rect + dashed inset topstitching, centered on the
+/// frame anchor `(ax, ay)` = `(pocket_center_x, pocket_top_y)`.
 /// `w`/`h` (frame size in px) are needed for the corner radius, which is
 /// circular in pixel space (0.012*w), hence elliptical in (u,v) space.
 pub fn pocket_template(w: f32, h: f32) -> Template {
     let (hw, hh) = (0.09f32, 0.06f32); // half-width 0.09w, height 0.06h
     let ru = 0.012f32;
     let rv = 0.012 * w / h;
-    let flap = rounded_rect_uv(-hw, -hh, 2.0 * hw, hh, ru, rv, 10);
+    let flap = rounded_rect_uv(-hw, 0.0, 2.0 * hw, hh, ru, rv, 10);
     // Dashed stitching inset 5px.
     let iu = 5.0 / w;
     let iv = 5.0 / h;
     let riu = 0.008f32;
     let riv = 0.008 * w / h;
-    let stitch = rounded_rect_uv(
-        -hw + iu,
-        -hh + iv,
-        2.0 * (hw - iu),
-        hh - 2.0 * iv,
-        riu,
-        riv,
-        10,
-    );
+    let stitch = rounded_rect_uv(-hw + iu, iv, 2.0 * (hw - iu), hh - 2.0 * iv, riu, riv, 10);
     Template {
         name: "pocket",
         paths: vec![TPath::closed(flap, false), TPath::closed(stitch, true)],
     }
 }
 
-/// Front view: collar band between the lapel notches. The target draws it as
-/// a flat band with a topstitched fall edge and a small center label/hanger.
-/// `vg` is the gorge (notch) row from the detector; photo measurement shows
-/// the actual notch 22px above the detector's y, so we apply that correction.
-/// The collar stands 29px above the corrected notch (photo-measured).
-/// Spans +/-0.14w to meet the lapel notches exactly.
-pub fn front_collar_template(vg: f32) -> Template {
-    // Photo evidence (pipeline coords): notch y=156, top y=127.
-    // Detector vg maps to y=178; correct by -22px, height 29px.
-    // With h~740: 22/740=0.030, 29/740=0.039.
-    let vg_corr = vg - 0.030;
-    let v_top = vg_corr - 0.039;
-    let hw = 0.14f32;
-    Template {
-        name: "front-collar",
-        paths: vec![
-            // Collar fall (top edge), slight upward arc at center.
-            TPath::solid(vec![
-                TPoint::Norm(-hw, v_top + 0.004),
-                TPoint::Norm(0.0, v_top),
-                TPoint::Norm(hw, v_top + 0.004),
-            ]),
-            // Collar bottom (neckline seam) — meets the gorge seam.
-            TPath::solid(vec![
-                TPoint::Norm(-hw, vg_corr),
-                TPoint::Norm(0.0, vg_corr - 0.004),
-                TPoint::Norm(hw, vg_corr),
-            ]),
-            // Collar ends (at the notches).
-            TPath::solid(vec![
-                TPoint::Norm(-hw, v_top + 0.004),
-                TPoint::Norm(-hw, vg_corr),
-            ]),
-            TPath::solid(vec![
-                TPoint::Norm(hw, v_top + 0.004),
-                TPoint::Norm(hw, vg_corr),
-            ]),
-            // Dashed topstitching below the fall edge.
-            TPath::dashed(vec![
-                TPoint::NormPx(-hw, v_top + 0.004, 3.0, 5.0),
-                TPoint::NormPx(0.0, v_top, 0.0, 5.0),
-                TPoint::NormPx(hw, v_top + 0.004, -3.0, 5.0),
-            ]),
-            // Center label/hanger: small rect on the neckline.
-            TPath::solid(vec![
-                TPoint::NormPx(-0.025, vg_corr - 0.004, 0.0, -2.0),
-                TPoint::NormPx(0.025, vg_corr - 0.004, 0.0, -2.0),
-                TPoint::NormPx(0.025, vg_corr - 0.004, 0.0, 6.0),
-                TPoint::NormPx(-0.025, vg_corr - 0.004, 0.0, 6.0),
-                TPoint::NormPx(-0.025, vg_corr - 0.004, 0.0, -2.0),
-            ]),
-        ],
-    }
-}
-
 /// Back view: collar band (top/bottom edges + sides), dashed topstitching
 /// along the collar bottom, and the dashed center back seam.
 pub fn back_collar_template() -> Template {
-    // #36: collar bottom extended to v=0.13 (was 0.09) so it overlaps the
-    // back silhouette instead of floating above it with a gap. The collar
-    // sits ON the back; drawn after the silhouette it renders on top.
-    // Widened 0.15->0.17 to match the target's broad flat collar.
     Template {
         name: "back-collar",
         paths: vec![
             // Collar top edge.
             TPath::solid(vec![
-                TPoint::Norm(-0.17, 0.02 + 0.006),
+                TPoint::Norm(-0.15, 0.02 + 0.008),
                 TPoint::Norm(0.0, 0.02),
-                TPoint::Norm(0.17, 0.02 + 0.006),
+                TPoint::Norm(0.15, 0.02 + 0.008),
             ]),
             // Collar bottom edge (gorge seam).
             TPath::solid(vec![
-                TPoint::Norm(-0.17 * 1.05, 0.13),
-                TPoint::Norm(0.0, 0.13 - 0.006),
-                TPoint::Norm(0.17 * 1.05, 0.13),
+                TPoint::Norm(-0.15 * 1.05, 0.09),
+                TPoint::Norm(0.0, 0.09 - 0.006),
+                TPoint::Norm(0.15 * 1.05, 0.09),
             ]),
             // Collar sides.
             TPath::solid(vec![
-                TPoint::Norm(-0.17, 0.02 + 0.006),
-                TPoint::Norm(-0.17 * 1.05, 0.13),
+                TPoint::Norm(-0.15, 0.02 + 0.008),
+                TPoint::Norm(-0.15 * 1.05, 0.09),
             ]),
             TPath::solid(vec![
-                TPoint::Norm(0.17, 0.02 + 0.006),
-                TPoint::Norm(0.17 * 1.05, 0.13),
+                TPoint::Norm(0.15, 0.02 + 0.008),
+                TPoint::Norm(0.15 * 1.05, 0.09),
             ]),
             // Dashed topstitching along collar bottom.
             TPath::dashed(vec![
-                TPoint::NormPx(-0.17 * 1.05, 0.13, 4.0, -5.0),
-                TPoint::NormPx(0.0, 0.13 - 0.006, 0.0, -5.0),
-                TPoint::NormPx(0.17 * 1.05, 0.13, -4.0, -5.0),
+                TPoint::NormPx(-0.15 * 1.05, 0.09, 4.0, -5.0),
+                TPoint::NormPx(0.0, 0.09 - 0.006, 0.0, -5.0),
+                TPoint::NormPx(0.15 * 1.05, 0.09, -4.0, -5.0),
             ]),
             // Center back seam (dashed).
             TPath::dashed(vec![
-                TPoint::NormPx(0.0, 0.13, 0.0, 8.0),
+                TPoint::NormPx(0.0, 0.09, 0.0, 8.0),
                 TPoint::Norm(0.0, 0.95),
             ]),
         ],
@@ -540,15 +451,13 @@ mod tests {
 
     #[test]
     fn lapel_template_has_expected_path_count() {
-        // Notched lapel with break: 1 break step + 2 solid lapel edges
-        // + 2 dashed stitching + 1 solid roll = 6 paths.
+        // 2 solid outer + 2 dashed stitching + 1 solid roll = 5 paths.
         let t = lapel_template(0.09, 0.4);
-        assert_eq!(t.paths.len(), 6);
+        assert_eq!(t.paths.len(), 5);
         assert_eq!(t.paths.iter().filter(|p| p.dashed).count(), 2);
-        // All straight lines have 2 points each.
-        for p in &t.paths {
-            assert_eq!(p.points.len(), 2);
-        }
+        // Curve paths are sampled into 17 points (16 segments).
+        assert_eq!(t.paths[1].points.len(), 17);
+        assert_eq!(t.paths[3].points.len(), 17);
     }
 
     #[test]

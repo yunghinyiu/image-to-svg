@@ -21,6 +21,12 @@ use serde::Serialize;
 use std::io::Cursor;
 use std::time::Instant;
 
+mod template;
+use template::{
+    back_collar_template, gorge_seam_template, lapel_template, pocket_template, render_template,
+    Placement, Template,
+};
+
 /// Max image side in px; larger inputs are downscaled for speed.
 const MAX_SIDE: u32 = 1600;
 
@@ -2136,6 +2142,23 @@ fn refine_pocket_y(buttons: &[Button], x0: f32, y0: f32, x1: f32, y1: f32, defau
     default_y
 }
 
+/// Render a [`Template`] through a [`Placement`] and append the resulting
+/// paths to the solid / dashed accumulators, preserving template path order.
+fn push_rendered(
+    solid: &mut Vec<Vec<(f32, f32)>>,
+    dashed: &mut Vec<Vec<(f32, f32)>>,
+    t: &Template,
+    p: &Placement,
+) {
+    for rp in render_template(t, p) {
+        if rp.dashed {
+            dashed.push(rp.points);
+        } else {
+            solid.push(rp.points);
+        }
+    }
+}
+
 fn generate_structure(
     buttons: &[Button],
     comps: &[Component],
@@ -2188,7 +2211,9 @@ fn generate_structure(
         }
     }
 
-    // Front view: lapels, collar, pockets.
+    // Front view: lapels, collar, pockets — via #28 Template/Placement.
+    // Landmarks (button-derived) stay here; template shapes live in
+    // template.rs and render through discrete Placements.
     if let Some(fi) = front_idx {
         let c = &comps[fi];
         let (x0, y0, x1, y1) = (c.x0 as f32, c.y0 as f32, c.x1 as f32, c.y1 as f32);
@@ -2207,9 +2232,8 @@ fn generate_structure(
             .map(|b| b.cy)
             .fold(f32::INFINITY, f32::min);
 
-        // Landmarks (proportions measured from the reference tech pack).
-        let y_neck = y0 + 0.06 * h;
-        // #20 refinement: gorge Y from top button (notch sits ~3% h above top button)
+        // Landmarks as fractions of frame height (proportions measured from
+        // the reference tech pack; #20 refinements anchor to buttons).
         let y_gorge_default = y0 + 0.09 * h;
         let y_gorge = if y_button.is_finite() {
             let refined = y_button - 0.03 * h;
@@ -2223,51 +2247,30 @@ fn generate_structure(
         } else {
             y_gorge_default
         };
-        let gorge_dx = 0.14 * w;
-        let btn_dx = 0.09 * w;
+        let frame = Placement {
+            ax: cx,
+            ay: y0,
+            w,
+            h,
+            mirror: false,
+        };
+        let vg = (y_gorge - y0) / h;
+        let vb = (y_button - y0) / h;
 
-        // Lapels (mirrored): notch-lapel with sharp peak. The silhouette
-        // already includes the collar bump; we add the lapel panels.
-        // Reference: angular geometry — notch -> peak (sharp out) -> break.
-        let wide_dx = 0.25 * w;
-        let y_peak = y0 + 0.24 * h;
-        for side in [-1.0f32, 1.0] {
-            let notch = (cx + side * gorge_dx, y_gorge);
-            let peak = (cx + side * wide_dx, y_peak);
-            let brk = (cx + side * btn_dx, y_button);
-            // Outer edge: notch -> peak (straight), peak -> break (gentle curve).
-            // Sharp corner at the peak for the notch-lapel point.
-            solid.push(vec![notch, peak]);
-            let c1 = (peak.0, peak.1 + (brk.1 - peak.1) * 0.35);
-            let c2 = (
-                peak.0 + side * (brk.0 - peak.0) * 0.3,
-                brk.1 - (brk.1 - peak.1) * 0.25,
-            );
-            solid.push(sample_cubic(peak, c1, c2, brk, 16));
-            // Dashed topstitching parallel to the outer edge, inset ~9px.
-            dashed.push(vec![
-                (notch.0 - side * 9.0, notch.1 + 2.0),
-                (peak.0 - side * 9.0, peak.1),
-            ]);
-            let inset_c1 = (c1.0 - side * 9.0, c1.1);
-            let inset_c2 = (c2.0 - side * 9.0, c2.1);
-            let inset_brk = (brk.0 - side * 9.0, brk.1);
-            let inset_peak = (peak.0 - side * 9.0, peak.1);
-            dashed.push(sample_cubic(inset_peak, inset_c1, inset_c2, inset_brk, 16));
-            // Roll line: the V from neck to button.
-            solid.push(vec![
-                (cx + side * gorge_dx * 0.55, y_neck + 0.01 * h),
-                (cx + side * gorge_dx * 0.42, (y_neck + y_button) * 0.5),
-                (cx + side * btn_dx * 0.5, y_button - 4.0),
-            ]);
-            // Gorge seam: collar bottom edge from center to notch.
-            // (Drawn once per side, meets at center.)
-            if side < 0.0 {
-                solid.push(vec![
-                    (cx - gorge_dx, y_gorge),
-                    (cx, y_gorge - 0.008 * h),
-                    (cx + gorge_dx, y_gorge),
-                ]);
+        // Lapels: canonical right-side template, mirrored for the left.
+        // Path order per side is preserved (outer edge, curve, stitching,
+        // roll line). Note: mirroring makes the left lapel curve a true
+        // mirror of the right; the pre-#28 code had a latent asymmetry
+        // (`side * (brk.0 - peak.0)` double-applied the side, bowing the
+        // left curve outward). See PR discussion.
+        let lapel = lapel_template(vg, vb);
+        for mirror in [true, false] {
+            let side_frame = Placement { mirror, ..frame };
+            push_rendered(&mut solid, &mut dashed, &lapel, &side_frame);
+            // Gorge seam is drawn once, after the left (mirrored) side,
+            // matching the original loop's `if side < 0.0` placement.
+            if mirror {
+                push_rendered(&mut solid, &mut dashed, &gorge_seam_template(vg), &frame);
             }
         }
 
@@ -2275,30 +2278,16 @@ fn generate_structure(
         // #20 refinement: align pocket Y to bottom button row.
         let pocket_y_default = y0 + 0.73 * h;
         let pocket_y = refine_pocket_y(buttons, x0, y0, x1, y1, pocket_y_default);
-        let pocket_dx = 0.25 * w;
-        let (pw, ph) = (0.18 * w, 0.06 * h);
+        let pocket = pocket_template(w, h);
         for side in [-1.0f32, 1.0] {
-            let pcx = cx + side * pocket_dx;
-            let mut rect = rounded_rect(pcx - pw / 2.0, pocket_y, pw, ph, 0.012 * w, 10);
-            // Explicitly close the loop.
-            if let Some(&p0) = rect.first() {
-                rect.push(p0);
-            }
-            solid.push(rect);
-            // Dashed stitching inset.
-            let inset = 5.0;
-            let mut stitch = rounded_rect(
-                pcx - pw / 2.0 + inset,
-                pocket_y + inset,
-                pw - 2.0 * inset,
-                ph - 2.0 * inset,
-                0.008 * w,
-                10,
-            );
-            if let Some(&p0) = stitch.first() {
-                stitch.push(p0);
-            }
-            dashed.push(stitch);
+            let pocket_frame = Placement {
+                ax: cx + side * 0.25 * w,
+                ay: pocket_y,
+                w,
+                h,
+                mirror: false,
+            };
+            push_rendered(&mut solid, &mut dashed, &pocket, &pocket_frame);
         }
     }
 
@@ -2308,87 +2297,17 @@ fn generate_structure(
         let (x0, y0, x1, y1) = (c.x0 as f32, c.y0 as f32, c.x1 as f32, c.y1 as f32);
         let w = x1 - x0;
         let h = y1 - y0;
-        let cx = (x0 + x1) * 0.5;
-        let collar_dx = 0.15 * w;
-        let y_ct = y0 + 0.02 * h;
-        let y_cb = y0 + 0.09 * h;
-        // Collar top edge.
-        solid.push(vec![
-            (cx - collar_dx, y_ct + 0.008 * h),
-            (cx, y_ct),
-            (cx + collar_dx, y_ct + 0.008 * h),
-        ]);
-        // Collar bottom edge (gorge seam).
-        solid.push(vec![
-            (cx - collar_dx * 1.05, y_cb),
-            (cx, y_cb - 0.006 * h),
-            (cx + collar_dx * 1.05, y_cb),
-        ]);
-        // Collar sides.
-        solid.push(vec![
-            (cx - collar_dx, y_ct + 0.008 * h),
-            (cx - collar_dx * 1.05, y_cb),
-        ]);
-        solid.push(vec![
-            (cx + collar_dx, y_ct + 0.008 * h),
-            (cx + collar_dx * 1.05, y_cb),
-        ]);
-        // Dashed topstitching along collar bottom.
-        dashed.push(vec![
-            (cx - collar_dx * 1.05 + 4.0, y_cb - 5.0),
-            (cx, y_cb - 0.006 * h - 5.0),
-            (cx + collar_dx * 1.05 - 4.0, y_cb - 5.0),
-        ]);
-        // Center back seam (dashed).
-        dashed.push(vec![(cx, y_cb + 8.0), (cx, y1 - 0.05 * h)]);
+        let frame = Placement {
+            ax: (x0 + x1) * 0.5,
+            ay: y0,
+            w,
+            h,
+            mirror: false,
+        };
+        push_rendered(&mut solid, &mut dashed, &back_collar_template(), &frame);
     }
 
     (solid, dashed)
-}
-
-/// Sample a cubic Bezier curve into `n` points.
-fn sample_cubic(
-    p0: (f32, f32),
-    p1: (f32, f32),
-    p2: (f32, f32),
-    p3: (f32, f32),
-    n: usize,
-) -> Vec<(f32, f32)> {
-    (0..=n)
-        .map(|i| {
-            let t = i as f32 / n as f32;
-            let u = 1.0 - t;
-            (
-                u * u * u * p0.0
-                    + 3.0 * u * u * t * p1.0
-                    + 3.0 * u * t * t * p2.0
-                    + t * t * t * p3.0,
-                u * u * u * p0.1
-                    + 3.0 * u * u * t * p1.1
-                    + 3.0 * u * t * t * p2.1
-                    + t * t * t * p3.1,
-            )
-        })
-        .collect()
-}
-
-/// Rounded rectangle as a closed polyline (last point connects to first).
-fn rounded_rect(x: f32, y: f32, w: f32, h: f32, r: f32, seg: usize) -> Vec<(f32, f32)> {
-    let mut pts = Vec::new();
-    // (center_x, center_y, start_angle_deg): TR, BR, BL, TL.
-    let corners = [
-        (x + w - r, y + r, -90.0),
-        (x + w - r, y + h - r, 0.0),
-        (x + r, y + h - r, 90.0),
-        (x + r, y + r, 180.0),
-    ];
-    for (ccx, ccy, start_deg) in corners {
-        for i in 0..=seg {
-            let ang = (start_deg + i as f32 * 90.0 / seg as f32).to_radians();
-            pts.push((ccx + r * ang.cos(), ccy + r * ang.sin()));
-        }
-    }
-    pts
 }
 
 /// Generate procedural topstitching (dashed) as inward offsets of the
@@ -3241,35 +3160,6 @@ mod tests {
         assert!(worst < 1.0, "wiggle not smoothed, worst={worst:.2}");
         // Overall curve preserved: interior points near the arc.
         assert!((sm[50].1 - 0.01 * 50.0 * 50.0).abs() < 2.0);
-    }
-
-    #[test]
-    fn sample_cubic_endpoints_and_count() {
-        let p0 = (0.0, 0.0);
-        let p1 = (10.0, 0.0);
-        let p2 = (10.0, 10.0);
-        let p3 = (20.0, 10.0);
-        let pts = sample_cubic(p0, p1, p2, p3, 10);
-        assert_eq!(pts.len(), 11);
-        assert!((pts[0].0 - p0.0).abs() < 1e-5 && (pts[0].1 - p0.1).abs() < 1e-5);
-        assert!((pts[10].0 - p3.0).abs() < 1e-5 && (pts[10].1 - p3.1).abs() < 1e-5);
-        // Monotonic in x for this curve.
-        for w in pts.windows(2) {
-            assert!(w[1].0 >= w[0].0);
-        }
-    }
-
-    #[test]
-    fn rounded_rect_is_closed_loop() {
-        let pts = rounded_rect(0.0, 0.0, 100.0, 50.0, 10.0, 4);
-        // 4 corners * (4+1) points.
-        assert_eq!(pts.len(), 20);
-        // All points within the rect bounds.
-        for &(x, y) in &pts {
-            assert!((0.0..=100.0).contains(&x) && (0.0..=50.0).contains(&y));
-        }
-        // Starts at top edge, ends at top edge (needs explicit close by caller).
-        assert!((pts[0].1 - 0.0).abs() < 1e-4);
     }
 
     #[test]
