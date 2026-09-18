@@ -8,6 +8,8 @@
 //! - /tmp/shading-normal.png: RGB normal map
 //! - /tmp/shading-curvature.png: curvature (fold) heatmap
 
+use image::GenericImageView;
+
 fn main() {
     let input_png = std::fs::read("samples/blazer/input.png").unwrap();
     let img = image::load_from_memory(&input_png).unwrap();

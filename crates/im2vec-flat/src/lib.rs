@@ -23,6 +23,7 @@ use std::time::Instant;
 
 mod detect;
 mod search;
+pub mod shading;
 mod template;
 use template::{
     back_collar_template, front_collar_template, gorge_seam_template, lapel_template,
