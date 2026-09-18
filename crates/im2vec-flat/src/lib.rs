@@ -516,7 +516,10 @@ fn symmetrize_components(
 ) {
     // Max relative area growth admitted from the mirror union: symmetric
     // fronts/backs stay far below this, side views grow far above it.
-    const BASE_MAX_GROWTH: f32 = 0.15;
+    // (Blazer sample: front 0.042, back 0.011, side 0.113 — 0.08 separates
+    // them; the old 0.15 wrongly symmetrized the side view, fabricating a
+    // phantom sleeve and halving its IoU.)
+    const BASE_MAX_GROWTH: f32 = 0.08;
     for (id, comp) in comps.iter_mut().enumerate().skip(1) {
         let label = id as u32;
         let (x0, x1, y0, y1) = (comp.x0, comp.x1, comp.y0, comp.y1);
@@ -555,8 +558,28 @@ fn symmetrize_components(
             }
         }
         if added as f32 > comp.area as f32 * rel_growth {
+            if std::env::var("IM2VEC_FLAT_DEBUG").is_ok() {
+                eprintln!(
+                    "sym: view bbox {:?} area {} growth {:.3} > limit {:.3} -> SKIP",
+                    (x0, y0, x1, y1),
+                    comp.area,
+                    added as f32 / comp.area as f32,
+                    rel_growth
+                );
+            }
             continue; // asymmetric view (e.g. side/profile near hem): leave alone
         }
+        if std::env::var("IM2VEC_FLAT_DEBUG").is_ok() {
+            eprintln!(
+                "sym: view bbox {:?} area {} growth {:.3} <= limit {:.3} -> SYMMETRIZE",
+                (x0, y0, x1, y1),
+                comp.area,
+                added as f32 / comp.area as f32,
+                rel_growth
+            );
+        }
+        // Mirror-union: fill each missing pixel from its mirror counterpart.
+        // Pixels owned by a neighbouring view are never stolen.
         for y in y0..y1 {
             for x in x0..x1 {
                 let i = y * w + x;
@@ -1741,12 +1764,12 @@ mod tests {
 
     #[test]
     fn symmetrize_mirrors_each_view_in_its_own_box() {
-        // Near-symmetric view: 4x2 block + one extra pixel mirrors the pixel
-        // across and reports symmetrized.
-        let (w, h) = (9usize, 4usize);
+        // Near-symmetric view: 6x2 block + one extra pixel (growth 1/13 ≈
+        // 7.7% < 8% limit) mirrors the pixel across and reports symmetrized.
+        let (w, h) = (13usize, 4usize);
         let mut m = vec![false; w * h];
         for y in 1..3 {
-            for x in 2..6 {
+            for x in 2..8 {
                 m[y * w + x] = true;
             }
         }
@@ -1755,8 +1778,28 @@ mod tests {
         assert_eq!(comps.len(), 2, "one view");
         symmetrize_components(&mut m, &labels, &mut comps, w, h);
         assert!(comps[1].symmetrized, "near-symmetric view averaged");
-        assert!(m[3 * w + 5], "extra pixel mirrored within its own box");
-        assert!(!m[3 * w + 8], "mirror never leaves the view's box");
+        assert!(m[3 * w + 7], "extra pixel mirrored within its own box");
+        assert!(!m[3 * w + 12], "mirror never leaves the view's box");
+    }
+
+    #[test]
+    fn symmetrize_rejects_eleven_percent_growth() {
+        // 4x2 block + one extra pixel: growth 1/9 ≈ 11% > 8% limit, so the
+        // view is left untouched (this is the blazer side-view regime: mirror
+        // growth 0.113 must NOT symmetrize).
+        let (w, h) = (9usize, 4usize);
+        let mut m = vec![false; w * h];
+        for y in 1..3 {
+            for x in 2..6 {
+                m[y * w + x] = true;
+            }
+        }
+        m[3 * w + 2] = true;
+        let before = m.clone();
+        let (labels, mut comps) = label_components(&m, w, h);
+        symmetrize_components(&mut m, &labels, &mut comps, w, h);
+        assert!(!comps[1].symmetrized, "11%-growth view must not symmetrize");
+        assert_eq!(m, before, "rejected view untouched");
     }
 
     #[test]
