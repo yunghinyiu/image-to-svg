@@ -489,7 +489,8 @@ fn convert_flat_rgb(rgb: &RgbImage, opts: &FlatOptions) -> Result<FlatOutput> {
     svg.push_str("</g>");
     // Phase 6: parametric structural linework (lapels, collar, pockets).
     // Solid edges in <g id="structure">, dashed details get per-path dash.
-    let (struct_solid, struct_dashed) = generate_structure(&buttons, &comps);
+    // Chains are passed for photo-driven template alignment (#20 refinement).
+    let (struct_solid, struct_dashed) = generate_structure(&buttons, &comps, &scaled);
     if !struct_solid.is_empty() || !struct_dashed.is_empty() {
         svg.push_str("<g id=\"structure\" fill=\"none\" stroke=\"#1a1a1a\" stroke-width=\"2\" stroke-linecap=\"round\" stroke-linejoin=\"round\">");
         for p in &struct_solid {
@@ -2111,7 +2112,35 @@ fn center_front(buttons: &[Button], x0: f32, y0: f32, x1: f32, y1: f32) -> Optio
 /// pocket topstitching and back-seam details are dashed.
 type StructurePaths = (Vec<Vec<(f32, f32)>>, Vec<Vec<(f32, f32)>>);
 
-fn generate_structure(buttons: &[Button], comps: &[Component]) -> StructurePaths {
+/// Refine pocket Y position using photo evidence (#20 template alignment).
+/// Uses button positions as reliable landmarks: on a double-breasted blazer,
+/// flap pockets sit just below the bottom button row.
+fn refine_pocket_y(buttons: &[Button], x0: f32, y0: f32, x1: f32, y1: f32, default_y: f32) -> f32 {
+    let h = y1 - y0;
+    // Find bottom-most button in the front component
+    let bottom_y = buttons
+        .iter()
+        .filter(|b| b.cx >= x0 && b.cx <= x1 && b.cy >= y0 && b.cy <= y1)
+        .map(|b| b.cy)
+        .fold(f32::NEG_INFINITY, f32::max);
+    if bottom_y.is_finite() {
+        // Pockets sit ~4% of h below the bottom button row
+        let refined = bottom_y + 0.04 * h;
+        // Sanity: must be within [0.60h, 0.85h] and not too far from default
+        let y_lo = y0 + 0.60 * h;
+        let y_hi = y0 + 0.85 * h;
+        if refined >= y_lo && refined <= y_hi && (refined - default_y).abs() < 0.10 * h {
+            return refined;
+        }
+    }
+    default_y
+}
+
+fn generate_structure(
+    buttons: &[Button],
+    comps: &[Component],
+    _chains: &[Vec<(f32, f32)>],
+) -> StructurePaths {
     let mut solid = Vec::new();
     let mut dashed = Vec::new();
 
@@ -2180,7 +2209,20 @@ fn generate_structure(buttons: &[Button], comps: &[Component]) -> StructurePaths
 
         // Landmarks (proportions measured from the reference tech pack).
         let y_neck = y0 + 0.06 * h;
-        let y_gorge = y0 + 0.09 * h;
+        // #20 refinement: gorge Y from top button (notch sits ~3% h above top button)
+        let y_gorge_default = y0 + 0.09 * h;
+        let y_gorge = if y_button.is_finite() {
+            let refined = y_button - 0.03 * h;
+            let y_lo = y0 + 0.05 * h;
+            let y_hi = y0 + 0.13 * h;
+            if refined >= y_lo && refined <= y_hi && (refined - y_gorge_default).abs() < 0.05 * h {
+                refined
+            } else {
+                y_gorge_default
+            }
+        } else {
+            y_gorge_default
+        };
         let gorge_dx = 0.14 * w;
         let btn_dx = 0.09 * w;
 
@@ -2230,7 +2272,9 @@ fn generate_structure(buttons: &[Button], comps: &[Component]) -> StructurePaths
         }
 
         // Pocket flaps (mirrored): rounded rect + dashed topstitching.
-        let pocket_y = y0 + 0.73 * h;
+        // #20 refinement: align pocket Y to bottom button row.
+        let pocket_y_default = y0 + 0.73 * h;
+        let pocket_y = refine_pocket_y(buttons, x0, y0, x1, y1, pocket_y_default);
         let pocket_dx = 0.25 * w;
         let (pw, ph) = (0.18 * w, 0.06 * h);
         for side in [-1.0f32, 1.0] {
@@ -3334,7 +3378,7 @@ mod tests {
                 cy: 566.0,
             },
         ];
-        let (solid, dashed) = generate_structure(&buttons, &comps);
+        let (solid, dashed) = generate_structure(&buttons, &comps, &[]);
         // Front: 2 lapel edges + 2 roll lines + 1 gorge + 2 notch ticks (in edge)
         //        + 2 pockets = ~9 solid; back: collar (4) = 4 solid.
         // Dashed: 2 lapel stitch + 2 pocket stitch + 1 collar stitch + 1 back seam.
@@ -3371,7 +3415,7 @@ mod tests {
                 symmetrized: true,
             },
         ];
-        let (solid, dashed) = generate_structure(&[], &comps);
+        let (solid, dashed) = generate_structure(&[], &comps, &[]);
         assert!(solid.is_empty() && dashed.is_empty());
     }
 }
