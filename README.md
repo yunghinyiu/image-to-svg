@@ -8,6 +8,7 @@ Built on [`vtracer`](https://github.com/visioncortex/VTracer) (MIT, pure Rust) �
 - `crates/im2vec-core` — decode + `ConvertOptions` (logo/illustration/photo/mono) + `convert_bytes`
 - `crates/im2vec-cli` — `im2vec input.png -o output.svg --preset logo`
 - `crates/im2vec-web` — dev server at `http://127.0.0.1:5173`: paste / drag-drop / browse an image, it auto-converts; tune sliders, side-by-side compare, download the SVG only if you like it
+- `crates/im2vec-flat` — clothing photo → tech-pack flat sketch: backdrop keying + XDoG linework + symmetrize (`--preset flat`; flat-lay only, on-model needs Phase-2 ML segmenter)
 - `samples/` — drop test logos here (not committed if large)
 
 ## Quickstart
@@ -25,5 +26,7 @@ PORT=5173 cargo run -p im2vec-web
 2. ✅ Slice 1: logo pipeline tuning (speckle, simplify, palette snapping)
 3. ✅ Slice 2/3: illustration + photo mode (watershed segmentation preserves gradients/shadows)
 4. ✅ Web UX: paste / drag-drop auto-convert, opt-in SVG download
-5. Slice 4: quality harness (render-back diff MSE/SSIM, A/B comparator)
-6. Slice 5: perf (rayon, Session caching for slider interactivity) + export PDF/EPS
+5. ✅ Slice 6 (Phase 1): flat-lay → flat sketch draft (silhouette + seams, symmetrized)
+6. Slice 7 (Phase 2): on-model photos via segformer-b2-clothes ONNX segmenter
+7. Slice 4: quality harness (render-back diff MSE/SSIM, A/B comparator)
+8. Slice 5: perf (rayon, Session caching for slider interactivity) + export PDF/EPS

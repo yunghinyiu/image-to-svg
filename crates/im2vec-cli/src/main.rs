@@ -10,6 +10,8 @@ enum PresetArg {
     Illustration,
     Photo,
     Mono,
+    /// Clothing photo -> tech-pack flat sketch (flat-lay only for now).
+    Flat,
 }
 
 impl From<PresetArg> for ImPreset {
@@ -19,6 +21,7 @@ impl From<PresetArg> for ImPreset {
             PresetArg::Illustration => ImPreset::Illustration,
             PresetArg::Photo => ImPreset::Photo,
             PresetArg::Mono => ImPreset::Mono,
+            PresetArg::Flat => ImPreset::Logo, // unused: flat routes to im2vec-flat
         }
     }
 }
@@ -59,6 +62,18 @@ struct Args {
     clustering: String,
     #[arg(long)]
     watershed_detail: Option<u32>,
+    /// flat preset only: flatlay | on-model (on-model needs Phase-2 ML segmenter)
+    #[arg(long, default_value = "flatlay")]
+    flat_input: String,
+    /// flat preset only: mirror-average around the vertical center axis
+    #[arg(long, default_value_t = true)]
+    symmetrize: bool,
+    /// flat preset only: silhouette outline stroke width in px
+    #[arg(long, default_value_t = 2.0)]
+    outline_width: f32,
+    /// flat preset only: 0..=1, higher keeps weaker lines (fabric folds)
+    #[arg(long, default_value_t = 0.6)]
+    detail_strength: f32,
 }
 
 fn main() -> Result<()> {
@@ -67,6 +82,29 @@ fn main() -> Result<()> {
 
     let bytes =
         std::fs::read(&args.input).with_context(|| format!("read {}", args.input.display()))?;
+
+    if matches!(args.preset, PresetArg::Flat) {
+        let flat = im2vec_flat::FlatOptions {
+            input: im2vec_flat::FlatInput::parse(&args.flat_input),
+            symmetrize: args.symmetrize,
+            outline_width: args.outline_width,
+            detail_strength: args.detail_strength,
+            speckle: args.filter_speckle,
+        };
+        let out = im2vec_flat::convert_flat_bytes(&bytes, &flat)?;
+        std::fs::write(&args.output, &out.svg)
+            .with_context(|| format!("write {}", args.output.display()))?;
+        eprintln!(
+            "im2vec flat: {}x{} -> {} paths, {} bytes svg in {:?} -> {}",
+            out.width,
+            out.height,
+            out.path_count,
+            out.svg_bytes,
+            t.elapsed(),
+            args.output.display()
+        );
+        return Ok(());
+    }
 
     let preset: ImPreset = args.preset.into();
     let mut opts = ConvertOptions::for_preset(preset);
