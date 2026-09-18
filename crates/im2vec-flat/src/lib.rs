@@ -25,8 +25,8 @@ mod detect;
 mod search;
 mod template;
 use template::{
-    back_collar_template, gorge_seam_template, lapel_template, pocket_template, render_template,
-    Placement, Template,
+    back_collar_template, front_collar_template, gorge_seam_template, lapel_template,
+    pocket_template, render_template, Placement, Template,
 };
 
 /// Max image side in px; larger inputs are downscaled for speed.
@@ -2401,6 +2401,13 @@ fn generate_structure(
                 );
             }
         }
+        // #17: front collar band between the notches (drawn once).
+        push_rendered(
+            &mut solid,
+            &mut dashed,
+            &front_collar_template(vg),
+            &lapel_frame,
+        );
 
         // Pocket flaps (mirrored): rounded rect + dashed topstitching.
         // #20 refinement: align pocket Y to bottom button row.
