@@ -311,7 +311,9 @@ fn convert_flat_rgb(rgb: &RgbImage, opts: &FlatOptions) -> Result<FlatOutput> {
             Some("fold") => ChainKind::Fold,
             Some("noise") => ChainKind::Noise,
             Some(other) => {
-                eprintln!("IM2VEC_LABELS_JSON: unknown label '{other}' for chain {idx}, using heuristic");
+                eprintln!(
+                    "IM2VEC_LABELS_JSON: unknown label '{other}' for chain {idx}, using heuristic"
+                );
                 classify_chain(c, &edge_band, rgb, w as usize, h as usize)
             }
             None => classify_chain(c, &edge_band, rgb, w as usize, h as usize),
@@ -338,13 +340,7 @@ fn convert_flat_rgb(rgb: &RgbImage, opts: &FlatOptions) -> Result<FlatOutput> {
     }
     if let Ok(dump_path) = std::env::var("IM2VEC_DUMP_CHAINS") {
         dump_chain_features(
-            &dump_path,
-            &scaled,
-            &labels,
-            &edge_band,
-            rgb,
-            w as usize,
-            h as usize,
+            &dump_path, &scaled, &labels, &edge_band, rgb, w as usize, h as usize,
         );
     }
     if std::env::var("IM2VEC_FLAT_DEBUG").is_ok() {
@@ -1616,8 +1612,12 @@ fn chain_edge_frac(c: &[(f32, f32)], edge_band: &[bool], w: usize, h: usize) -> 
 
 /// Bounding box and centroid of a chain (output coords).
 fn chain_bbox_centroid(c: &[(f32, f32)]) -> ((f32, f32, f32, f32), (f32, f32)) {
-    let (mut x0, mut y0, mut x1, mut y1) =
-        (f32::INFINITY, f32::INFINITY, f32::NEG_INFINITY, f32::NEG_INFINITY);
+    let (mut x0, mut y0, mut x1, mut y1) = (
+        f32::INFINITY,
+        f32::INFINITY,
+        f32::NEG_INFINITY,
+        f32::NEG_INFINITY,
+    );
     let (mut sx, mut sy) = (0.0f32, 0.0f32);
     for &(px, py) in c {
         x0 = x0.min(px);
@@ -1684,7 +1684,11 @@ fn load_label_override() -> Option<std::collections::HashMap<usize, String>> {
     let path = std::env::var("IM2VEC_LABELS_JSON").ok()?;
     let text = std::fs::read_to_string(&path).ok()?;
     let mut map = std::collections::HashMap::new();
-    for pair in text.trim().trim_matches(|c| c == '{' || c == '}').split(',') {
+    for pair in text
+        .trim()
+        .trim_matches(|c| c == '{' || c == '}')
+        .split(',')
+    {
         let mut kv = pair.splitn(2, ':');
         let (k, v) = (kv.next()?.trim(), kv.next()?.trim());
         let id: usize = k.trim_matches('"').parse().ok()?;
