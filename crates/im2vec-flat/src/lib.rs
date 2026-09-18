@@ -189,6 +189,15 @@ fn aniso_scale_mask(mask: &[bool], w: usize, h: usize, sx: f32, sy: f32) -> Vec<
     out
 }
 
+/// #38: map a photo-coordinate point into the compensated output frame —
+/// the point-wise form of the same transform [`aniso_scale_mask`] applies to
+/// the silhouette bitmap and the button emission applies to buttons. Keeps
+/// silhouette, structure, detail, and buttons in one consistent frame.
+fn compensate_point(x: f32, y: f32, w: f32, h: f32, sx: f32, sy: f32) -> (f32, f32) {
+    let (cx, cy) = (w / 2.0, h / 2.0);
+    ((x - cx) * sx + cx, (y - cy) * sy + cy)
+}
+
 /// Full-resolution garment mask (white = garment) for the eval harness.
 /// Runs the same backdrop-keying + symmetrization as [`convert_flat_bytes`];
 /// additive measurement API, does not change pipeline output.
@@ -232,10 +241,23 @@ fn convert_flat_rgb(rgb: &RgbImage, opts: &FlatOptions) -> Result<FlatOutput> {
     // Uniform symbol radius (reference proportions), scaled to output width.
     let button_r = 9.4 * w as f32 / 1536.0;
     separate_buttons(&mut buttons, 2.0 * (button_r + 1.0) + 2.0);
+    // #35: snap front buttons to a fitted 2x3 grid (artist-regular).
+    // Front = largest component (skip background comps[0]).
+    if let Some(front) = comps.iter().skip(1).max_by_key(|c| c.area) {
+        snap_front_buttons_to_grid(
+            &mut buttons,
+            front.x0 as f32,
+            front.x1 as f32,
+            front.y0 as f32,
+            front.y1 as f32,
+        );
+    }
     stage(&mut stages, "button detection", t);
 
-    // #19: Apply artist proportion compensation AFTER button detection.
-    // The scaled mask is used for the silhouette path and eval IoU.
+    // #19: Apply artist proportion compensation to the silhouette mask.
+    // #38: the SAME transform is applied to structure/detail/button geometry
+    // in Rust below, so the whole drawing lives in one consistent frame
+    // (previously structure stayed in photo coords — internally inconsistent).
     let (sx, sy) = opts.proportion_compensation;
     let mask = if (sx - 1.0).abs() > 1e-6 || (sy - 1.0).abs() > 1e-6 {
         aniso_scale_mask(&mask_unscaled, w as usize, h as usize, sx, sy)
@@ -451,6 +473,10 @@ fn convert_flat_rgb(rgb: &RgbImage, opts: &FlatOptions) -> Result<FlatOutput> {
             n_noise
         );
     }
+    // #38: detail + structure geometry is traced in photo coords; map it into
+    // the compensated output frame (same transform as silhouette/buttons).
+    let (dsx, dsy) = opts.proportion_compensation;
+    let dpt = |x: f32, y: f32| compensate_point(x, y, w as f32, h as f32, dsx, dsy);
     svg.push_str("<g id=\"seams\" fill=\"none\" stroke=\"#1a1a1a\" stroke-width=\"2\" stroke-linecap=\"round\" stroke-linejoin=\"round\">");
     let mut n_det = 0;
     // Phase 5: suppress doubled seam lines before emitting.
@@ -465,17 +491,21 @@ fn convert_flat_rgb(rgb: &RgbImage, opts: &FlatOptions) -> Result<FlatOutput> {
         // Phase 5: light DP smoothing — the photo-traced chains carry
         // sub-pixel skeleton jitter; the reference draws smooth lines.
         let sc = simplify_dp(c, 2.0);
-        svg.push_str(&format!("<path d=\"M{:.1},{:.1}", sc[0].0, sc[0].1));
+        let (mx, my) = dpt(sc[0].0, sc[0].1);
+        svg.push_str(&format!("<path d=\"M{mx:.1},{my:.1}"));
         for &(px, py) in &sc[1..] {
-            svg.push_str(&format!("L{:.1},{:.1}", px, py));
+            let (lx, ly) = dpt(px, py);
+            svg.push_str(&format!("L{lx:.1},{ly:.1}"));
         }
         svg.push_str("\"/>");
     }
     for c in folds.iter() {
         n_det += 1;
-        svg.push_str(&format!("<path d=\"M{:.1},{:.1}", c[0].0, c[0].1));
+        let (mx, my) = dpt(c[0].0, c[0].1);
+        svg.push_str(&format!("<path d=\"M{mx:.1},{my:.1}"));
         for &(px, py) in &c[1..] {
-            svg.push_str(&format!("L{:.1},{:.1}", px, py));
+            let (lx, ly) = dpt(px, py);
+            svg.push_str(&format!("L{lx:.1},{ly:.1}"));
         }
         svg.push_str("\"/>");
     }
@@ -488,9 +518,11 @@ fn convert_flat_rgb(rgb: &RgbImage, opts: &FlatOptions) -> Result<FlatOutput> {
     svg.push_str("<g id=\"stitching\" fill=\"none\" stroke=\"#1a1a1a\" stroke-width=\"1.5\" stroke-linecap=\"round\" stroke-linejoin=\"round\" stroke-dasharray=\"7 4\">");
     for p in stitch_paths.iter().chain(stitches.iter()) {
         n_det += 1;
-        svg.push_str(&format!("<path d=\"M{:.1},{:.1}", p[0].0, p[0].1));
+        let (mx, my) = dpt(p[0].0, p[0].1);
+        svg.push_str(&format!("<path d=\"M{mx:.1},{my:.1}"));
         for &(px, py) in &p[1..] {
-            svg.push_str(&format!("L{:.1},{:.1}", px, py));
+            let (lx, ly) = dpt(px, py);
+            svg.push_str(&format!("L{lx:.1},{ly:.1}"));
         }
         svg.push_str("\"/>");
     }
@@ -503,16 +535,20 @@ fn convert_flat_rgb(rgb: &RgbImage, opts: &FlatOptions) -> Result<FlatOutput> {
     if !struct_solid.is_empty() || !struct_dashed.is_empty() {
         svg.push_str("<g id=\"structure\" fill=\"none\" stroke=\"#1a1a1a\" stroke-width=\"2\" stroke-linecap=\"round\" stroke-linejoin=\"round\">");
         for p in &struct_solid {
-            svg.push_str(&format!("<path d=\"M{:.1},{:.1}", p[0].0, p[0].1));
+            let (mx, my) = dpt(p[0].0, p[0].1);
+            svg.push_str(&format!("<path d=\"M{mx:.1},{my:.1}"));
             for &(px, py) in &p[1..] {
-                svg.push_str(&format!("L{:.1},{:.1}", px, py));
+                let (lx, ly) = dpt(px, py);
+                svg.push_str(&format!("L{lx:.1},{ly:.1}"));
             }
             svg.push_str("\"/>");
         }
         for p in &struct_dashed {
-            svg.push_str(&format!("<path d=\"M{:.1},{:.1}", p[0].0, p[0].1));
+            let (mx, my) = dpt(p[0].0, p[0].1);
+            svg.push_str(&format!("<path d=\"M{mx:.1},{my:.1}"));
             for &(px, py) in &p[1..] {
-                svg.push_str(&format!("L{:.1},{:.1}", px, py));
+                let (lx, ly) = dpt(px, py);
+                svg.push_str(&format!("L{lx:.1},{ly:.1}"));
             }
             svg.push_str("\" stroke-dasharray=\"7 4\"/>");
         }
@@ -543,8 +579,8 @@ fn convert_flat_rgb(rgb: &RgbImage, opts: &FlatOptions) -> Result<FlatOutput> {
             -hd, -hd, hd, -hd, -hd, hd, hd, hd,
         ));
         svg.push_str("<g id=\"buttons\">");
-        // #19: Scale button positions by the proportion compensation,
-        // matching the scaled silhouette.
+        // #19/#38: button positions get the same proportion compensation as
+        // the silhouette and structure, keeping one consistent frame.
         let (psx, psy) = opts.proportion_compensation;
         let (bcx, bcy) = (w as f32 / 2.0, h as f32 / 2.0);
         for b in &buttons {
@@ -1500,6 +1536,49 @@ fn separate_buttons(buttons: &mut [Button], min_dist: f32) {
     }
 }
 
+/// #35: snap the 6 front buttons to a fitted 2x3 grid. A tech-pack artist
+/// draws front buttons on a perfect grid; photo detections carry a few px of
+/// jitter (and our columns were converging). Least-squares fit the grid from
+/// the detections, then replace positions with the grid points — still traced
+/// from the photo, just regularized.
+fn snap_front_buttons_to_grid(buttons: &mut [Button], x0: f32, x1: f32, y0: f32, y1: f32) {
+    // Front buttons: inside the front component bbox, 6 expected (2 cols x 3 rows).
+    let mut idx: Vec<usize> = buttons
+        .iter()
+        .enumerate()
+        .filter(|(_, b)| b.cx >= x0 && b.cx <= x1 && b.cy >= y0 && b.cy <= y1)
+        .map(|(i, _)| i)
+        .collect();
+    if idx.len() != 6 {
+        return;
+    }
+    // Sort into 3 rows by y, then 2 columns by x within each row.
+    idx.sort_by(|&a, &b| buttons[a].cy.partial_cmp(&buttons[b].cy).unwrap());
+    let mut rows: Vec<[usize; 2]> = Vec::new();
+    for r in 0..3 {
+        let mut pair = [idx[r * 2], idx[r * 2 + 1]];
+        if buttons[pair[0]].cx > buttons[pair[1]].cx {
+            pair.swap(0, 1);
+        }
+        rows.push(pair);
+    }
+    // Grid lines: column x = mean of column, row y = mean of row.
+    let col_x = [
+        rows.iter().map(|r| buttons[r[0]].cx).sum::<f32>() / 3.0,
+        rows.iter().map(|r| buttons[r[1]].cx).sum::<f32>() / 3.0,
+    ];
+    let row_y: Vec<f32> = rows
+        .iter()
+        .map(|r| (buttons[r[0]].cy + buttons[r[1]].cy) / 2.0)
+        .collect();
+    for (r, row) in rows.iter().enumerate() {
+        for (c, &bi) in row.iter().enumerate() {
+            buttons[bi].cx = col_x[c];
+            buttons[bi].cy = row_y[r];
+        }
+    }
+}
+
 /// Detect buttons in the photo: gold-chroma round blobs inside the garment
 /// mask. Gold buttons read R-B strongly positive while denim reads strongly
 /// negative, so a single chroma gate separates them; roundness/size gates
@@ -2124,6 +2203,7 @@ type StructurePaths = (Vec<Vec<(f32, f32)>>, Vec<Vec<(f32, f32)>>);
 /// Refine pocket Y position using photo evidence (#20 template alignment).
 /// Uses button positions as reliable landmarks: on a double-breasted blazer,
 /// flap pockets sit just below the bottom button row.
+/// Returns the flap's BOTTOM edge y (the pocket template is bottom-anchored).
 fn refine_pocket_y(buttons: &[Button], x0: f32, y0: f32, x1: f32, y1: f32, default_y: f32) -> f32 {
     let h = y1 - y0;
     // Find bottom-most button in the front component
@@ -2133,8 +2213,9 @@ fn refine_pocket_y(buttons: &[Button], x0: f32, y0: f32, x1: f32, y1: f32, defau
         .map(|b| b.cy)
         .fold(f32::NEG_INFINITY, f32::max);
     if bottom_y.is_finite() {
-        // Pockets sit ~4% of h below the bottom button row
-        let refined = bottom_y + 0.04 * h;
+        // Flap bottom sits ~10% of h below the bottom button row
+        // (old top-anchored 4% + one flap height of 6%).
+        let refined = bottom_y + 0.10 * h;
         // Sanity: must be within [0.60h, 0.85h] and not too far from default
         let y_lo = y0 + 0.60 * h;
         let y_hi = y0 + 0.85 * h;
