@@ -281,21 +281,33 @@ pub fn gorge_seam_template(vg: f32) -> Template {
     }
 }
 
-/// Pocket flap: rounded rect + dashed inset topstitching, centered on the
-/// frame anchor `(ax, ay)` = `(pocket_center_x, pocket_top_y)`.
+/// Pocket flap: rounded rect + dashed inset topstitching, anchored at the frame
+/// `(ax, ay)` = `(pocket_center_x, pocket_bottom_y)`.
+///
+/// Bottom-anchored because the detector (`detect::detect_pocket_y`) keys on the
+/// flap's strong bottom edge — the underlay check (photo underneath, trace from
+/// it) showed a top-anchored placement draws the flap one flap-height too low.
 /// `w`/`h` (frame size in px) are needed for the corner radius, which is
 /// circular in pixel space (0.012*w), hence elliptical in (u,v) space.
 pub fn pocket_template(w: f32, h: f32) -> Template {
     let (hw, hh) = (0.09f32, 0.06f32); // half-width 0.09w, height 0.06h
     let ru = 0.012f32;
     let rv = 0.012 * w / h;
-    let flap = rounded_rect_uv(-hw, 0.0, 2.0 * hw, hh, ru, rv, 10);
+    let flap = rounded_rect_uv(-hw, -hh, 2.0 * hw, hh, ru, rv, 10);
     // Dashed stitching inset 5px.
     let iu = 5.0 / w;
     let iv = 5.0 / h;
     let riu = 0.008f32;
     let riv = 0.008 * w / h;
-    let stitch = rounded_rect_uv(-hw + iu, iv, 2.0 * (hw - iu), hh - 2.0 * iv, riu, riv, 10);
+    let stitch = rounded_rect_uv(
+        -hw + iu,
+        -hh + iv,
+        2.0 * (hw - iu),
+        hh - 2.0 * iv,
+        riu,
+        riv,
+        10,
+    );
     Template {
         name: "pocket",
         paths: vec![TPath::closed(flap, false), TPath::closed(stitch, true)],
