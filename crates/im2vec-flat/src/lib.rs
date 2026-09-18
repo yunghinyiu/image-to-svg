@@ -1006,7 +1006,7 @@ fn merge_collinear(chains: &mut Vec<Vec<(f32, f32)>>, gap: f32) {
     /// oriented coords where the join sits at the tail / head respectively.
     fn end_dir(pts: &[(f32, f32)], tail: bool) -> (f32, f32) {
         let n = pts.len();
-        let k = (n - 1).min(3).max(1);
+        let k = (n - 1).clamp(1, 3);
         let (ax, ay, bx, by) = if tail {
             let (ax, ay) = pts[n - 1 - k];
             let (bx, by) = pts[n - 1];
@@ -1726,7 +1726,10 @@ mod tests {
                 hi = hi.max(v);
             }
         }
-        assert!(hi - lo < 0.02, "test field must be isoluminant, got {lo:.3}..{hi:.3}");
+        assert!(
+            hi - lo < 0.02,
+            "test field must be isoluminant, got {lo:.3}..{hi:.3}"
+        );
         let xd = xdog_lines(&img, 0.6);
         let near = xd
             .chains
@@ -1734,7 +1737,7 @@ mod tests {
             .filter(|c| {
                 !c.is_empty()
                     && c.iter().any(|&(px, py)| {
-                        px >= 40.0 && px <= 80.0 && py >= 60.0 && py <= 100.0
+                        (40.0..=80.0).contains(&px) && (60.0..=100.0).contains(&py)
                     })
             })
             .count();
@@ -1874,7 +1877,12 @@ mod tests {
             ],
         ];
         merge_collinear(&mut chains, 6.0);
-        assert_eq!(chains.len(), 1, "arc joins via tangents, got {}", chains.len());
+        assert_eq!(
+            chains.len(),
+            1,
+            "arc joins via tangents, got {}",
+            chains.len()
+        );
         assert_eq!(chains[0].len(), 10);
     }
 
