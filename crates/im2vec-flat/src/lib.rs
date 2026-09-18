@@ -1673,7 +1673,7 @@ fn dump_chain_features(
             "{{\"id\":{i},\"label\":\"{label}\",\"n_points\":{},\"arc_len\":{:.1},\
              \"straightness\":{:.3},\"mean_lum\":{:.1},\"bright_frac\":{:.2},\
              \"edge_frac\":{:.2},\"bbox\":[{x0:.1},{y0:.1},{x1:.1},{y1:.1}],\
-             \"centroid\":[{cx:.1},{cy:.1}]}}",
+             \"centroid\":[{cx:.1},{cy:.1}],\"points\":[",
             c.len(),
             arc_len(c),
             straightness(c),
@@ -1681,6 +1681,13 @@ fn dump_chain_features(
             bright_frac,
             edge_frac,
         ));
+        for (j, &(px, py)) in c.iter().enumerate() {
+            if j > 0 {
+                out.push(',');
+            }
+            out.push_str(&format!("[{px:.1},{py:.1}]"));
+        }
+        out.push_str("]}");
     }
     out.push_str("]}");
     if let Err(e) = std::fs::write(path, out) {
