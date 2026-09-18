@@ -175,6 +175,16 @@ fn convert_flat_rgb(rgb: &RgbImage, opts: &FlatOptions) -> Result<FlatOutput> {
     let (mask, _labels, comps) = mask_and_components(rgb, opts.symmetrize)?;
     stage(&mut stages, "background keying", t);
 
+    // Phase 4: button detection on the photo (gold-chroma round blobs).
+    // Detected buttons render as standardized symbols later; their raw
+    // traces are suppressed in the detail pass below.
+    let t = Instant::now();
+    let mut buttons = detect_buttons(rgb, &mask);
+    // Uniform symbol radius (reference proportions), scaled to output width.
+    let button_r = 9.4 * w as f32 / 1536.0;
+    separate_buttons(&mut buttons, 2.0 * (button_r + 1.0) + 2.0);
+    stage(&mut stages, "button detection", t);
+
     // 2. silhouette pass: black garment on white.
     let t = Instant::now();
     let sil_img = mask_to_color(&mask, w, h);
@@ -281,6 +291,35 @@ fn convert_flat_rgb(rgb: &RgbImage, opts: &FlatOptions) -> Result<FlatOutput> {
         .filter(|c| c.len() >= 2)
         .map(|c| c.iter().map(|&(px, py)| (px * sxx, py * syy)).collect())
         .collect();
+    // Phase 4: drop the photo's own button traces — short loops centered on
+    // a detected button. The standardized symbols replace them. Long lines
+    // (placket, cuff edges) that merely pass near a button are kept; the
+    // symbol's white knockout covers the hidden span.
+    let scaled: Vec<Vec<(f32, f32)>> = if buttons.is_empty() {
+        scaled
+    } else {
+        let br = button_r;
+        scaled
+            .into_iter()
+            .filter(|c| {
+                if arc_len(c) >= 150.0 {
+                    return true;
+                }
+                // A button's own trace coils around its center: centroid near
+                // the button and no point reaching far past the symbol.
+                // Anything reaching further out is real linework passing by.
+                let n = c.len() as f32;
+                let (sx, sy) = c
+                    .iter()
+                    .fold((0.0f32, 0.0f32), |(a, b), &(x, y)| (a + x, b + y));
+                !buttons.iter().any(|bt| {
+                    (sx / n - bt.cx).hypot(sy / n - bt.cy) < br + 4.0
+                        && c.iter()
+                            .all(|&(x, y)| (x - bt.cx).hypot(y - bt.cy) < br + 10.0)
+                })
+            })
+            .collect()
+    };
     let keep_folds = opts.detail_strength > 0.8;
     // Edge band for stitch detection: pixels within 30px of silhouette boundary.
     // Short chains here are photo topstitching; elsewhere they're texture.
@@ -344,6 +383,7 @@ fn convert_flat_rgb(rgb: &RgbImage, opts: &FlatOptions) -> Result<FlatOutput> {
         );
     }
     if std::env::var("IM2VEC_FLAT_DEBUG").is_ok() {
+        eprintln!("button detection: {} buttons", buttons.len());
         eprintln!(
             "chain classifier: {} seam, {} stitch, {} fold (kept={}), {} noise dropped",
             seams.len(),
@@ -375,7 +415,40 @@ fn convert_flat_rgb(rgb: &RgbImage, opts: &FlatOptions) -> Result<FlatOutput> {
         }
         svg.push_str("\"/>");
     }
-    svg.push_str("</g></svg>");
+    svg.push_str("</g>");
+    // Phase 4: standardized button symbols. One symbol in <defs> (outer
+    // ring + 4-hole dots, reference proportions: ring r = 9.4px at 1536px
+    // wide, holes at +/-0.21r, hole r = 0.13r, all detached so the ring
+    // reads as a clean stroked circle), instantiated per detected button.
+    // Buttons draw last so they sit above seams/stitching.
+    if !buttons.is_empty() {
+        let br = button_r;
+        let hd = 0.21 * br;
+        let hr = 0.13 * br;
+        // White knockout first: the button occludes whatever linework passes
+        // behind it (placket lines, cuff stitching), so the ring always reads
+        // as a clean isolated circle. Sized for a ~2px clearance past the
+        // ring's outer edge so antialiased linework can't bridge the gap.
+        let ko = br + 3.0;
+        svg.push_str(&format!(
+            "<defs><g id=\"btn\"><circle r=\"{ko:.1}\" fill=\"#ffffff\"/>\
+             <circle r=\"{br:.1}\" fill=\"none\" stroke=\"#1a1a1a\" stroke-width=\"2\"/>\
+             <circle cx=\"{:.1}\" cy=\"{:.1}\" r=\"{hr:.1}\" fill=\"#1a1a1a\"/>\
+             <circle cx=\"{:.1}\" cy=\"{:.1}\" r=\"{hr:.1}\" fill=\"#1a1a1a\"/>\
+             <circle cx=\"{:.1}\" cy=\"{:.1}\" r=\"{hr:.1}\" fill=\"#1a1a1a\"/>\
+             <circle cx=\"{:.1}\" cy=\"{:.1}\" r=\"{hr:.1}\" fill=\"#1a1a1a\"/></g></defs>",
+            -hd, -hd, hd, -hd, -hd, hd, hd, hd,
+        ));
+        svg.push_str("<g id=\"buttons\">");
+        for b in &buttons {
+            svg.push_str(&format!(
+                "<use href=\"#btn\" x=\"{:.1}\" y=\"{:.1}\"/>",
+                b.cx, b.cy
+            ));
+        }
+        svg.push_str("</g>");
+    }
+    svg.push_str("</svg>");
 
     Ok(FlatOutput {
         path_count: styled_sil.len() + n_det,
@@ -1278,6 +1351,82 @@ fn merge_collinear(chains: &mut Vec<Vec<(f32, f32)>>, gap: f32) {
         chains.remove(j);
     }
     chains.retain(|c| c.len() >= 2);
+}
+
+/// A button detected in the photo, in output-px coords. Phase 4 draws these
+/// as standardized symbols (uniform ring + 4-hole dots) instead of tracing
+/// their ragged photo loops.
+struct Button {
+    cx: f32,
+    cy: f32,
+}
+
+/// Push overlapping button symbols apart (like a tech-pack artist spacing
+/// tight cuff buttons): any pair closer than `min_dist` is separated along
+/// its axis until exactly `min_dist` apart. Photo-perspective can place cuff
+/// buttons closer than two ring radii; without this their rings merge into
+/// one blob.
+fn separate_buttons(buttons: &mut [Button], min_dist: f32) {
+    for _ in 0..10 {
+        let mut moved = false;
+        for i in 0..buttons.len() {
+            for j in (i + 1)..buttons.len() {
+                let dx = buttons[j].cx - buttons[i].cx;
+                let dy = buttons[j].cy - buttons[i].cy;
+                let d = dx.hypot(dy);
+                if d < min_dist && d > 1e-6 {
+                    let push = (min_dist - d) / 2.0;
+                    let (ux, uy) = (dx / d, dy / d);
+                    buttons[i].cx -= ux * push;
+                    buttons[i].cy -= uy * push;
+                    buttons[j].cx += ux * push;
+                    buttons[j].cy += uy * push;
+                    moved = true;
+                }
+            }
+        }
+        if !moved {
+            break;
+        }
+    }
+}
+
+/// Detect buttons in the photo: gold-chroma round blobs inside the garment
+/// mask. Gold buttons read R-B strongly positive while denim reads strongly
+/// negative, so a single chroma gate separates them; roundness/size gates
+/// reject half-occluded edge slivers and large beige regions. Returns
+/// centroids in output-px coords (the symbol itself is uniform — detection
+/// only decides presence and position).
+fn detect_buttons(rgb: &RgbImage, mask: &[bool]) -> Vec<Button> {
+    let (w, h) = (rgb.width() as usize, rgb.height() as usize);
+    let raw = rgb.as_raw();
+    let gold: Vec<bool> = (0..w * h)
+        .map(|i| mask[i] && (raw[3 * i] as i16 - raw[3 * i + 2] as i16) > 45)
+        .collect();
+    let (_labels, comps) = label_components(&gold, w, h);
+    let mut out = Vec::new();
+    for c in comps.iter().skip(1) {
+        let (bw, bh) = ((c.x1 - c.x0) as f32, (c.y1 - c.y0) as f32);
+        // Equivalent radius in output px; gates validated on the blazer
+        // sample (front buttons r~7.6, cuff r~5.5 at 1600x900).
+        let r = (c.area as f32 / std::f32::consts::PI).sqrt();
+        if !(4.5..=12.0).contains(&r) {
+            continue;
+        }
+        let aspect = bw / bh.max(1.0);
+        if !(0.6..=1.6).contains(&aspect) {
+            continue;
+        }
+        let solidity = c.area as f32 / (bw * bh).max(1.0);
+        if solidity < 0.45 {
+            continue;
+        }
+        out.push(Button {
+            cx: (c.x0 + c.x1) as f32 / 2.0,
+            cy: (c.y0 + c.y1) as f32 / 2.0,
+        });
+    }
+    out
 }
 
 /// Outer boundary loops of small compact response components, in small-px
@@ -2202,6 +2351,45 @@ mod tests {
         assert_eq!(n, 50, "both views kept, speck dropped, got {n}");
         let (_, comps) = label_components(&m, w, h);
         assert_eq!(comps.len(), 3, "two views labelled");
+    }
+
+    #[test]
+    fn detect_buttons_finds_gold_disks() {
+        // 60x60: white backdrop, gray garment block, one gold disk (button)
+        // and one isoluminant gray disk (not a button).
+        let (w, h) = (60u32, 60u32);
+        let mut img = RgbImage::from_pixel(w, h, Rgb([255, 255, 255]));
+        let mut mask = vec![false; (w * h) as usize];
+        let disk = |img: &mut RgbImage, cx: i32, cy: i32, r: i32, c: Rgb<u8>| {
+            for y in 0..h as i32 {
+                for x in 0..w as i32 {
+                    if (x - cx).pow(2) + (y - cy).pow(2) <= r * r {
+                        img.put_pixel(x as u32, y as u32, c);
+                    }
+                }
+            }
+        };
+        for y in 10..50 {
+            for x in 10..50 {
+                img.put_pixel(x, y, Rgb([120, 130, 160])); // denim-ish
+                mask[(y * w + x) as usize] = true;
+            }
+        }
+        disk(&mut img, 25, 25, 7, Rgb([170, 140, 100])); // gold button
+        disk(&mut img, 40, 40, 7, Rgb([120, 120, 120])); // gray disk: no
+        let buttons = detect_buttons(&img, &mask);
+        assert_eq!(
+            buttons.len(),
+            1,
+            "exactly the gold disk, got {}",
+            buttons.len()
+        );
+        assert!(
+            (buttons[0].cx - 25.0).abs() < 1.5 && (buttons[0].cy - 25.0).abs() < 1.5,
+            "centroid on the gold disk, got ({:.1},{:.1})",
+            buttons[0].cx,
+            buttons[0].cy
+        );
     }
 
     #[test]
