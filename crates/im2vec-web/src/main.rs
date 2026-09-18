@@ -59,6 +59,7 @@ async fn api_convert(mut mp: Multipart) -> Result<Json<ConvertResponse>, (Status
     let mut opts = ConvertOptions::default();
     let mut preset_raw = String::from("logo");
     let mut flat_input = String::from("flatlay");
+    let mut detail_strength = 0.6f32;
 
     while let Some(field) = mp
         .next_field()
@@ -78,6 +79,11 @@ async fn api_convert(mut mp: Multipart) -> Result<Json<ConvertResponse>, (Status
                 opts = ConvertOptions::for_preset(parse_preset(&preset_raw));
             }
             "flat_input" => flat_input = text.trim().to_string(),
+            "detail_strength" => {
+                if let Ok(v) = text.trim().parse() {
+                    detail_strength = v;
+                }
+            }
             "mode" => opts.mode = text.trim().to_string(),
             "hierarchical" => opts.hierarchical = text.trim().to_string(),
             "filter_speckle" => {
@@ -145,7 +151,7 @@ async fn api_convert(mut mp: Multipart) -> Result<Json<ConvertResponse>, (Status
                     symmetrize: true,
                     symmetrize_lines: false,
                     outline_width: 2.0,
-                    detail_strength: 0.6,
+                    detail_strength,
                     speckle,
                 },
             )
@@ -282,6 +288,8 @@ const INDEX_HTML: &str = r#"<!doctype html>
     <input id="filter_speckle" type="range" min="0" max="32" value="4"/>
     <label>Simplify (px, 0 = off) <span id="simpv">1.0</span></label>
     <input id="simplify" type="range" min="0" max="30" value="10"/>
+    <label>Detail — flat linework (0 = clean, 1 = every seam) <span id="detv">0.6</span></label>
+    <input id="detail_strength" type="range" min="0" max="10" value="6"/>
     <div class="row">
       <div><label>Color precision</label><select id="color_precision"><option>4</option><option>5</option><option selected>6</option><option>7</option><option>8</option></select></div>
       <div><label>Path precision</label><select id="path_precision"><option>1</option><option selected>2</option><option>3</option></select></div>
@@ -316,6 +324,7 @@ let currentName = "";
 $('max_colors').oninput = e => $('maxv').textContent = e.target.value;
 $('filter_speckle').oninput = e => $('speckv').textContent = e.target.value;
 $('simplify').oninput = e => $('simpv').textContent = (e.target.value/10).toFixed(1);
+$('detail_strength').oninput = e => $('detv').textContent = (e.target.value/10).toFixed(1);
 $('preset').onchange = e => {
   const v = e.target.value;
   if (v === 'logo') $('max_colors').value = 8;
@@ -386,6 +395,7 @@ async function convert() {
   fd.append('max_colors', mc);
   const s = ($('simplify').value/10).toFixed(1);
   fd.append('simplify', s === '0.0' ? 'off' : s);
+  fd.append('detail_strength', ($('detail_strength').value/10).toFixed(1));
   try {
     const r = await fetch('/api/convert', { method: 'POST', body: fd });
     if (!r.ok) throw new Error(await r.text());
@@ -425,7 +435,7 @@ function renderPipeline(j){
   $('thumbs').innerHTML = h;
   const preset = $('preset').value;
   $('params').textContent = preset === 'flat'
-    ? 'flatlay · symmetrized · outline 2.0px · detail 0.6'
+    ? 'flatlay · symmetrized · outline 2.0px · detail ' + ($('detail_strength').value/10).toFixed(1)
     : `${preset} · ${$('mode').value} · ${$('hierarchical').value} · ${$('clustering').value}`;
 }
 $('go').onclick = convert;

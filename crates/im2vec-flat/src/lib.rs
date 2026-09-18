@@ -547,14 +547,95 @@ fn xdog_lines(lum: &[f32], w: u32, h: u32, strength: f32) -> Vec<u8> {
         };
         *o = (v.clamp(0.0, 1.0) * 255.0) as u8;
     }
-    // Binarize for a clean trace: lines black, rest white.
-    for v in small_out.iter_mut() {
-        *v = if *v < 235 { 0 } else { 255 };
+    // Hysteresis: confident lines seed, faint lines survive only when
+    // connected to confident ones. Joins dotted seams, drops lone noise.
+    // Then an area opening removes remaining tiny specks.
+    let high = 210u8;
+    let low = (225.0 + 10.0 * strength.clamp(0.0, 1.0)) as u8;
+    let min_size = (30.0 - 20.0 * strength.clamp(0.0, 1.0)) as usize;
+    let mut kept = hysteresis(&small_out, swu, shu, high, low);
+    sweep_small(&mut kept, swu, shu, min_size);
+    let mut bin = vec![255u8; swu * shu];
+    for (i, &k) in kept.iter().enumerate() {
+        if k {
+            bin[i] = 0;
+        }
     }
     if sw == w && sh == h {
-        return small_out;
+        return bin;
     }
-    upscale_nearest_u8(&small_out, sw, sh, w, h)
+    upscale_nearest_u8(&bin, sw, sh, w, h)
+}
+
+/// Keep pixels darker than `low` that connect (8-way) to a pixel darker
+/// than `high`.
+fn hysteresis(v: &[u8], w: usize, h: usize, high: u8, low: u8) -> Vec<bool> {
+    let mut kept = vec![false; w * h];
+    let mut stack = Vec::new();
+    for (i, &px) in v.iter().enumerate() {
+        if px < high {
+            kept[i] = true;
+            stack.push(i);
+        }
+    }
+    while let Some(i) = stack.pop() {
+        let (x, y) = (i % w, i / w);
+        for dy in -1i32..=1 {
+            for dx in -1i32..=1 {
+                if dx == 0 && dy == 0 {
+                    continue;
+                }
+                let (nx, ny) = (x as i32 + dx, y as i32 + dy);
+                if nx < 0 || ny < 0 || nx >= w as i32 || ny >= h as i32 {
+                    continue;
+                }
+                let j = ny as usize * w + nx as usize;
+                if !kept[j] && v[j] < low {
+                    kept[j] = true;
+                    stack.push(j);
+                }
+            }
+        }
+    }
+    kept
+}
+
+/// Zero connected components smaller than `min_size` px (area opening).
+fn sweep_small(kept: &mut [bool], w: usize, h: usize, min_size: usize) {
+    let mut seen = vec![false; w * h];
+    for i in 0..w * h {
+        if !kept[i] || seen[i] {
+            continue;
+        }
+        let mut comp = Vec::new();
+        let mut stack = vec![i];
+        seen[i] = true;
+        while let Some(j) = stack.pop() {
+            comp.push(j);
+            let (x, y) = (j % w, j / w);
+            if x > 0 && kept[j - 1] && !seen[j - 1] {
+                seen[j - 1] = true;
+                stack.push(j - 1);
+            }
+            if x + 1 < w && kept[j + 1] && !seen[j + 1] {
+                seen[j + 1] = true;
+                stack.push(j + 1);
+            }
+            if y > 0 && kept[j - w] && !seen[j - w] {
+                seen[j - w] = true;
+                stack.push(j - w);
+            }
+            if y + 1 < h && kept[j + w] && !seen[j + w] {
+                seen[j + w] = true;
+                stack.push(j + w);
+            }
+        }
+        if comp.len() < min_size {
+            for j in comp {
+                kept[j] = false;
+            }
+        }
+    }
 }
 
 /// Nearest-sample a u8 gray image straight from the float luminance buffer.
