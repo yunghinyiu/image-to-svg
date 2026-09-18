@@ -55,6 +55,13 @@ pub struct FlatOptions {
     pub detail_strength: f32,
     /// vtracer speckle filter side length for both passes.
     pub speckle: usize,
+    /// Aniso scale (sx, sy) applied to the silhouette mask to compensate for
+    /// the systematic proportion gap between photo-derived masks and artist
+    /// technical-flat drawings. Artists draw idealized proportions vs the
+    /// photo's perspective; on the blazer sample the gap is ~18% wider and
+    /// ~27% taller (per-view aniso alignment). Default is the blazer-calibrated
+    /// (1.18, 1.27); set to (1.0, 1.0) to disable.
+    pub proportion_compensation: (f32, f32),
 }
 
 impl Default for FlatOptions {
@@ -66,6 +73,7 @@ impl Default for FlatOptions {
             outline_width: 2.0,
             detail_strength: 0.6,
             speckle: 4,
+            proportion_compensation: (1.18, 1.27),
         }
     }
 }
@@ -135,17 +143,42 @@ fn mask_and_components(
 ) -> Result<(Vec<bool>, Vec<u32>, Vec<Component>)> {
     let (w, h) = (rgb.width(), rgb.height());
     let lum = luminance(rgb);
-    let mut mask = smooth_mask(&foreground_mask(&lum, w, h), w, h, 2);
+    let raw = foreground_mask(&lum, w, h);
+    let mask = smooth_mask(&raw, w, h, 2);
     let (labels, mut comps) = label_components(&mask, w as usize, h as usize);
     if symmetrize {
         // Per-view: no cross-view contamination, no re-label needed (the
         // mirror pass never steals pixels from a neighbouring view).
-        symmetrize_components(&mut mask, &labels, &mut comps, w as usize, h as usize);
+        let mut mask_mut = mask;
+        symmetrize_components(&mut mask_mut, &labels, &mut comps, w as usize, h as usize);
+        if !mask_mut.iter().any(|&b| b) {
+            bail!("no garment found — flat mode needs a plain, bright backdrop behind the garment");
+        }
+        Ok((mask_mut, labels, comps))
+    } else {
+        if !mask.iter().any(|&b| b) {
+            bail!("no garment found — flat mode needs a plain, bright backdrop behind the garment");
+        }
+        Ok((mask, labels, comps))
     }
-    if !mask.iter().any(|&b| b) {
-        bail!("no garment found — flat mode needs a plain, bright backdrop behind the garment");
+}
+
+/// Aniso-scale a binary mask by (sx, sy) using nearest-neighbor.
+/// Output has the same dimensions; the mask is scaled about its center.
+fn aniso_scale_mask(mask: &[bool], w: usize, h: usize, sx: f32, sy: f32) -> Vec<bool> {
+    let mut out = vec![false; w * h];
+    let (cx, cy) = (w as f32 / 2.0, h as f32 / 2.0);
+    for y in 0..h {
+        for x in 0..w {
+            // Map output pixel to input coordinates (inverse transform)
+            let ix = ((x as f32 - cx) / sx + cx).round() as i32;
+            let iy = ((y as f32 - cy) / sy + cy).round() as i32;
+            if ix >= 0 && iy >= 0 && ix < w as i32 && iy < h as i32 {
+                out[y * w + x] = mask[iy as usize * w + ix as usize];
+            }
+        }
     }
-    Ok((mask, labels, comps))
+    out
 }
 
 /// Full-resolution garment mask (white = garment) for the eval harness.
@@ -157,7 +190,14 @@ pub fn flat_garment_mask(png_bytes: &[u8], opts: &FlatOptions) -> Result<GrayIma
     }
     let rgb = decode_downscaled(png_bytes)?;
     let (w, h) = (rgb.width(), rgb.height());
-    let (mask, _, _) = mask_and_components(&rgb, opts.symmetrize)?;
+    let (mask_unscaled, _, _) = mask_and_components(&rgb, opts.symmetrize)?;
+    // Apply proportion compensation (#19) to match pipeline output.
+    let (sx, sy) = opts.proportion_compensation;
+    let mask = if (sx - 1.0).abs() > 1e-6 || (sy - 1.0).abs() > 1e-6 {
+        aniso_scale_mask(&mask_unscaled, w as usize, h as usize, sx, sy)
+    } else {
+        mask_unscaled
+    };
     GrayImage::from_raw(
         w,
         h,
@@ -172,18 +212,28 @@ fn convert_flat_rgb(rgb: &RgbImage, opts: &FlatOptions) -> Result<FlatOutput> {
 
     // 1. foreground mask via backdrop keying.
     let t = Instant::now();
-    let (mask, _labels, comps) = mask_and_components(rgb, opts.symmetrize)?;
+    let (mask_unscaled, _labels, comps) = mask_and_components(rgb, opts.symmetrize)?;
     stage(&mut stages, "background keying", t);
 
     // Phase 4: button detection on the photo (gold-chroma round blobs).
     // Detected buttons render as standardized symbols later; their raw
     // traces are suppressed in the detail pass below.
+    // Uses the UNSCALED mask: scaling merges adjacent gold regions (#19).
     let t = Instant::now();
-    let mut buttons = detect_buttons(rgb, &mask);
+    let mut buttons = detect_buttons(rgb, &mask_unscaled);
     // Uniform symbol radius (reference proportions), scaled to output width.
     let button_r = 9.4 * w as f32 / 1536.0;
     separate_buttons(&mut buttons, 2.0 * (button_r + 1.0) + 2.0);
     stage(&mut stages, "button detection", t);
+
+    // #19: Apply artist proportion compensation AFTER button detection.
+    // The scaled mask is used for the silhouette path and eval IoU.
+    let (sx, sy) = opts.proportion_compensation;
+    let mask = if (sx - 1.0).abs() > 1e-6 || (sy - 1.0).abs() > 1e-6 {
+        aniso_scale_mask(&mask_unscaled, w as usize, h as usize, sx, sy)
+    } else {
+        mask_unscaled
+    };
 
     // 2. silhouette pass: black garment on white.
     let t = Instant::now();
@@ -461,10 +511,16 @@ fn convert_flat_rgb(rgb: &RgbImage, opts: &FlatOptions) -> Result<FlatOutput> {
             -hd, -hd, hd, -hd, -hd, hd, hd, hd,
         ));
         svg.push_str("<g id=\"buttons\">");
+        // #19: Scale button positions by the proportion compensation,
+        // matching the scaled silhouette.
+        let (psx, psy) = opts.proportion_compensation;
+        let (bcx, bcy) = (w as f32 / 2.0, h as f32 / 2.0);
         for b in &buttons {
+            let bx = (b.cx - bcx) * psx + bcx;
+            let by = (b.cy - bcy) * psy + bcy;
             svg.push_str(&format!(
                 "<use href=\"#btn\" x=\"{:.1}\" y=\"{:.1}\"/>",
-                b.cx, b.cy
+                bx, by
             ));
         }
         svg.push_str("</g>");
@@ -2551,6 +2607,31 @@ mod tests {
         m[0] = true;
         let s = smooth_mask(&m, 30, 30, 2);
         assert_eq!(s.iter().filter(|&&b| b).count(), 400);
+    }
+
+    #[test]
+    fn aniso_scale_mask_identity() {
+        // (1.0, 1.0) is a no-op.
+        let mut m = vec![false; 100];
+        m[44] = true;
+        m[55] = true;
+        let s = aniso_scale_mask(&m, 10, 10, 1.0, 1.0);
+        assert_eq!(s, m);
+    }
+
+    #[test]
+    fn aniso_scale_mask_expands_about_center() {
+        // Single pixel at center stays at center under 2x scale.
+        let mut m = vec![false; 100];
+        m[5 * 10 + 5] = true;
+        let s = aniso_scale_mask(&m, 10, 10, 2.0, 2.0);
+        assert!(s[5 * 10 + 5]);
+        // Pixel left of center moves further left.
+        let mut m2 = vec![false; 100];
+        m2[5 * 10 + 3] = true;
+        let s2 = aniso_scale_mask(&m2, 10, 10, 2.0, 1.0);
+        // (3-5)*2+5 = 1
+        assert!(s2[5 * 10 + 1]);
     }
 
     #[test]

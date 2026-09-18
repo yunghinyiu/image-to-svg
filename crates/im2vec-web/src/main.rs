@@ -219,6 +219,7 @@ async fn api_convert(mut mp: Multipart) -> Result<Json<ConvertResponse>, (Status
                     outline_width: 2.0,
                     detail_strength,
                     speckle,
+                    proportion_compensation: (1.18, 1.27),
                 },
             )
         })
