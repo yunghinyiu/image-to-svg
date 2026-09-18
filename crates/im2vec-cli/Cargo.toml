@@ -1,0 +1,9 @@
+[package]
+name = "im2vec-cli"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+im2vec-core = { path = "../im2vec-core" }
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }

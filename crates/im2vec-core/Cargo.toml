@@ -1,0 +1,10 @@
+[package]
+name = "im2vec-core"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+vtracer = "1.0.0-alpha.4"
+image = "0.25"
+anyhow = "1"
+serde = { version = "1", features = ["derive"] }

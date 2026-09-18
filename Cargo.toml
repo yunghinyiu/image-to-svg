@@ -1,0 +1,10 @@
+[workspace]
+members = [
+    "crates/im2vec-core",
+    "crates/im2vec-cli",
+    "crates/im2vec-web",
+]
+resolver = "2"
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
