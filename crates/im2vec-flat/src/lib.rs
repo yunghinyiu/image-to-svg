@@ -395,7 +395,25 @@ fn convert_flat_rgb(rgb: &RgbImage, opts: &FlatOptions) -> Result<FlatOutput> {
     }
     svg.push_str("<g id=\"seams\" fill=\"none\" stroke=\"#1a1a1a\" stroke-width=\"2\" stroke-linecap=\"round\" stroke-linejoin=\"round\">");
     let mut n_det = 0;
-    for c in seams.iter().chain(folds.iter()) {
+    // Phase 5: suppress doubled seam lines before emitting.
+    let seam_keep = dedup_parallel(&seams);
+    let mut n_dedup = 0;
+    for (c, &k) in seams.iter().zip(seam_keep.iter()) {
+        if !k {
+            n_dedup += 1;
+            continue;
+        }
+        n_det += 1;
+        // Phase 5: light DP smoothing — the photo-traced chains carry
+        // sub-pixel skeleton jitter; the reference draws smooth lines.
+        let sc = simplify_dp(c, 2.0);
+        svg.push_str(&format!("<path d=\"M{:.1},{:.1}", sc[0].0, sc[0].1));
+        for &(px, py) in &sc[1..] {
+            svg.push_str(&format!("L{:.1},{:.1}", px, py));
+        }
+        svg.push_str("\"/>");
+    }
+    for c in folds.iter() {
         n_det += 1;
         svg.push_str(&format!("<path d=\"M{:.1},{:.1}", c[0].0, c[0].1));
         for &(px, py) in &c[1..] {
@@ -404,6 +422,9 @@ fn convert_flat_rgb(rgb: &RgbImage, opts: &FlatOptions) -> Result<FlatOutput> {
         svg.push_str("\"/>");
     }
     svg.push_str("</g>");
+    if std::env::var("IM2VEC_FLAT_DEBUG").is_ok() {
+        eprintln!("dedup_parallel: suppressed {n_dedup} doubled seam chains");
+    }
     // Procedural topstitching (dashed) — generated hems/cuffs + smoothed photo stitching.
     let stitch_paths = generate_stitching(&mask, &comps, w as usize, h as usize);
     svg.push_str("<g id=\"stitching\" fill=\"none\" stroke=\"#1a1a1a\" stroke-width=\"1.5\" stroke-linecap=\"round\" stroke-linejoin=\"round\" stroke-dasharray=\"7 4\">");
@@ -1687,6 +1708,76 @@ fn arc_len(c: &[(f32, f32)]) -> f32 {
         .sum()
 }
 
+/// Distance from a point to a polyline (min over segments).
+fn point_to_polyline(x: f32, y: f32, poly: &[(f32, f32)]) -> f32 {
+    let mut best = f32::INFINITY;
+    for w in poly.windows(2) {
+        let (ax, ay) = w[0];
+        let (bx, by) = w[1];
+        let (dx, dy) = (bx - ax, by - ay);
+        let len2 = dx * dx + dy * dy;
+        let t = if len2 > 0.0 {
+            ((x - ax) * dx + (y - ay) * dy) / len2
+        } else {
+            0.0
+        }
+        .clamp(0.0, 1.0);
+        let d = (x - (ax + t * dx)).hypot(y - (ay + t * dy));
+        if d < best {
+            best = d;
+        }
+    }
+    best
+}
+
+/// Phase 5 (ink thrift): suppress doubled linework. XDoG often fires on both
+/// edges of a seam band, so the classifier keeps two near-parallel chains
+/// where the reference draws one clean line. A chain is redundant when most
+/// of its points lie within `TOL` px of a longer chain — the longer (usually
+/// the stronger, more central response) survives. Returns a keep-mask
+/// parallel to `chains`.
+fn dedup_parallel(chains: &[&Vec<(f32, f32)>]) -> Vec<bool> {
+    const TOL: f32 = 8.0;
+    const COVER_ECHO: f32 = 0.7; // shorter chain mostly hugging a longer one
+    const COVER_DUP: f32 = 0.85; // near-duplicate of similar length
+    let n = chains.len();
+    let mut keep = vec![true; n];
+    // Longest first so the dominant line always wins ties.
+    let mut order: Vec<usize> = (0..n).collect();
+    order.sort_by(|&a, &b| {
+        arc_len(chains[b])
+            .partial_cmp(&arc_len(chains[a]))
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    for (oi, &i) in order.iter().enumerate() {
+        if !keep[i] || chains[i].len() < 2 {
+            continue;
+        }
+        let len_i = arc_len(chains[i]);
+        for &j in &order[..oi] {
+            if !keep[j] || chains[j].len() < 2 {
+                continue;
+            }
+            let len_j = arc_len(chains[j]);
+            // j is at least as long as i. How much of i hugs j?
+            let mut near = 0usize;
+            for &(x, y) in chains[i].iter() {
+                if point_to_polyline(x, y, chains[j]) <= TOL {
+                    near += 1;
+                }
+            }
+            let cover = near as f32 / chains[i].len() as f32;
+            let is_echo = len_j >= 1.5 * len_i && cover >= COVER_ECHO;
+            let is_dup = len_j < 1.5 * len_i && cover >= COVER_DUP;
+            if is_echo || is_dup {
+                keep[i] = false;
+                break;
+            }
+        }
+    }
+    keep
+}
+
 /// Semantic label for a detail chain (Phase 3: linework semantics).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ChainKind {
@@ -1941,7 +2032,7 @@ fn generate_stitching(
                 }
             } else {
                 if arc_len(&cur) >= min_len {
-                    out.push(simplify_dp(&offset_up(cur, INSET), 1.5));
+                    out.push(simplify_dp(&smooth_y(&offset_up(cur, INSET), 12), 2.5));
                 }
                 cur = Vec::new();
                 if let Some(y) = by {
@@ -1951,7 +2042,7 @@ fn generate_stitching(
             prev_y = by;
         }
         if arc_len(&cur) >= min_len {
-            out.push(simplify_dp(&offset_up(cur, INSET), 1.5));
+            out.push(simplify_dp(&smooth_y(&offset_up(cur, INSET), 12), 2.5));
         }
         if std::env::var("IM2VEC_FLAT_DEBUG").is_ok() {
             eprintln!(
@@ -1971,6 +2062,27 @@ fn generate_stitching(
 /// Offset a bottom-edge polyline upward (inward) by `d` px.
 fn offset_up(pts: Vec<(f32, f32)>, d: f32) -> Vec<(f32, f32)> {
     pts.into_iter().map(|(x, y)| (x, y - d)).collect()
+}
+
+/// Phase 5: moving-average smooth of an x-monotonic hem/cuff trace. The raw
+/// bottom-boundary follows every photo wiggle; the reference draws topstitching
+/// as one smooth line parallel to the hem. Averages y over ±`radius` px,
+/// preserving the hem's overall curve while removing high-frequency jitter.
+fn smooth_y(pts: &[(f32, f32)], radius: usize) -> Vec<(f32, f32)> {
+    let n = pts.len();
+    if n < 3 {
+        return pts.to_vec();
+    }
+    let r = radius.min(n / 2);
+    pts.iter()
+        .enumerate()
+        .map(|(i, &(x, _))| {
+            let lo = i.saturating_sub(r);
+            let hi = (i + r + 1).min(n);
+            let sum: f32 = pts[lo..hi].iter().map(|p| p.1).sum();
+            (x, sum / (hi - lo) as f32)
+        })
+        .collect()
 }
 
 /// Douglas-Peucker simplification (recursive; chains are short).
@@ -2657,5 +2769,49 @@ mod tests {
         )
         .unwrap_err();
         assert!(err.to_string().contains("Phase-2"), "got: {err}");
+    }
+
+    #[test]
+    fn dedup_parallel_suppresses_echo_keeps_solo() {
+        // Long vertical line + a shorter parallel echo 4px away + one far solo line.
+        let long: Vec<(f32, f32)> = (0..=20).map(|i| (0.0, i as f32 * 5.0)).collect();
+        let echo: Vec<(f32, f32)> = (0..=10).map(|i| (4.0, i as f32 * 5.0)).collect();
+        let solo: Vec<(f32, f32)> = (0..=20).map(|i| (100.0, i as f32 * 5.0)).collect();
+        let chains = vec![&long, &echo, &solo];
+        let keep = dedup_parallel(&chains);
+        assert_eq!(keep, vec![true, false, true], "echo suppressed, solo kept");
+    }
+
+    #[test]
+    fn dedup_parallel_keeps_crossing_lines() {
+        // Perpendicular crossing: short horizontal bar across a long vertical.
+        let vert: Vec<(f32, f32)> = (0..=20).map(|i| (0.0, i as f32 * 5.0)).collect();
+        let horiz: Vec<(f32, f32)> = (0..=20).map(|i| (i as f32 * 5.0 - 50.0, 50.0)).collect();
+        let chains = vec![&vert, &horiz];
+        let keep = dedup_parallel(&chains);
+        assert_eq!(keep, vec![true, true], "crossing lines both kept");
+    }
+
+    #[test]
+    fn smooth_y_removes_wiggle_keeps_curve() {
+        // Gentle arc with ±3px high-frequency wiggle.
+        let pts: Vec<(f32, f32)> = (0..100)
+            .map(|i| {
+                let x = i as f32;
+                let y = 0.01 * x * x + 3.0 * ((x * 1.7).sin());
+                (x, y)
+            })
+            .collect();
+        let sm = smooth_y(&pts, 12);
+        assert_eq!(sm.len(), pts.len());
+        // Wiggle amplitude collapsed in the interior (full symmetric window):
+        // residual vs pure arc small.
+        let worst: f32 = sm[20..80]
+            .iter()
+            .map(|&(x, y)| (y - 0.01 * x * x).abs())
+            .fold(0.0, f32::max);
+        assert!(worst < 1.0, "wiggle not smoothed, worst={worst:.2}");
+        // Overall curve preserved: interior points near the arc.
+        assert!((sm[50].1 - 0.01 * 50.0 * 50.0).abs() < 2.0);
     }
 }
