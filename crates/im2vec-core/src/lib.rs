@@ -182,9 +182,16 @@ pub fn convert_bytes(bytes: &[u8], opts: &ConvertOptions) -> Result<ConvertOutpu
     convert_image(&img, w, h, opts)
 }
 
-pub fn convert_image(img: &ColorImage, w: u32, h: u32, opts: &ConvertOptions) -> Result<ConvertOutput> {
+pub fn convert_image(
+    img: &ColorImage,
+    w: u32,
+    h: u32,
+    opts: &ConvertOptions,
+) -> Result<ConvertOutput> {
     let cfg = opts.to_vtracer_config();
-    let pipeline = cfg.build().map_err(|e| anyhow::anyhow!("vtracer build: {e:?}"))?;
+    let pipeline = cfg
+        .build()
+        .map_err(|e| anyhow::anyhow!("vtracer build: {e:?}"))?;
     let svg = pipeline
         .to_svg(img)
         .map_err(|e| anyhow::anyhow!("vtracer convert: {e:?}"))?;

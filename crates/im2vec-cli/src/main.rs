@@ -1,6 +1,6 @@
 use anyhow::{Context, Result};
 use clap::{Parser, ValueEnum};
-use im2vec_core::{ConvertOptions, ImPreset, convert_bytes};
+use im2vec_core::{convert_bytes, ConvertOptions, ImPreset};
 use std::path::PathBuf;
 use std::time::Instant;
 
@@ -65,8 +65,8 @@ fn main() -> Result<()> {
     let args = Args::parse();
     let t = Instant::now();
 
-    let bytes = std::fs::read(&args.input)
-        .with_context(|| format!("read {}", args.input.display()))?;
+    let bytes =
+        std::fs::read(&args.input).with_context(|| format!("read {}", args.input.display()))?;
 
     let preset: ImPreset = args.preset.into();
     let mut opts = ConvertOptions::for_preset(preset);
@@ -80,13 +80,13 @@ fn main() -> Result<()> {
         opts.simplify = args.simplify;
     }
     opts.path_precision = args.path_precision;
-    if args.color_precision.is_some() {
-        opts.color_precision = args.color_precision.unwrap();
+    if let Some(v) = args.color_precision {
+        opts.color_precision = v;
     }
-    if args.gradient_step.is_some() {
-        opts.gradient_step = args.gradient_step.unwrap();
+    if let Some(v) = args.gradient_step {
+        opts.gradient_step = v;
     }
-    if (!args.clustering.is_empty()) {
+    if !args.clustering.is_empty() {
         opts.clustering = args.clustering;
     }
     if args.watershed_detail.is_some() {

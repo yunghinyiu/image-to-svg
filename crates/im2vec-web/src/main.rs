@@ -1,11 +1,11 @@
 use axum::{
-    Json, Router,
     extract::{DefaultBodyLimit, Multipart},
     http::StatusCode,
     response::Html,
     routing::{get, post},
+    Json, Router,
 };
-use im2vec_core::{ConvertOptions, ImPreset, convert_bytes};
+use im2vec_core::{convert_bytes, ConvertOptions, ImPreset};
 use serde::Serialize;
 use std::time::Instant;
 
