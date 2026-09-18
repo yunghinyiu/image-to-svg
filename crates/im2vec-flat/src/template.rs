@@ -240,10 +240,12 @@ pub fn lapel_template_with_peak(vg: f32, _vb: f32, peak_x: f32) -> Template {
     // Target shows a pronounced step, not a subtle one.
     // PEAK MUST BE FURTHER OUT than notch_outer to create the jut.
     let break_pt = (0.08f32, vg); // BREAK: collar ends here
-    let notch_outer = (0.16f32, vg + 0.015f32); // Step outward AND down (pronounced)
-    let peak = (peak_x, vg + 0.030f32); // Peak FURTHER OUT (jut!)
-                                        // brk: where lapel meets front edge. NOT at button (vb) — above it.
-                                        // Target lapel height ~0.35 (vg=0.08 to brk=0.43).
+                                  // Notch: HORIZONTAL step outward (same Y as break for sharp 90° corner).
+    let notch_outer = (0.16f32, vg); // Step outward, NO vertical drop
+                                     // Peak: widest point, just below notch (shallow top edge).
+    let peak = (peak_x, vg + 0.06f32); // Peak close to notch (shallow angle)
+                                       // brk: where lapel meets front edge. NOT at button (vb) — above it.
+                                       // Target lapel height ~0.35 (vg=0.08 to brk=0.43).
     let brk = (0.10f32, vg + 0.35f32); // Meets front edge above button
                                        // (Old cubic curve rendered a rounded shield; removed per target.)
     Template {

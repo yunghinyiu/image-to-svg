@@ -2424,8 +2424,8 @@ fn generate_structure(
             // Template lapel: break -> notch -> peak -> brk
             // (No curvature snap — the map is too noisy, jumps to wrinkles.
             //  Template position comes from detector; shape is the focus.)
-            // Peak x=0.15 per target measurement (was 0.26, too far out).
-            let lapel = lapel_template_with_peak(vg_snap, vb, 0.15);
+            // Peak x=0.20: moderate jut (0.30 was too wide).
+            let lapel = lapel_template_with_peak(vg_snap, vb, 0.20);
             push_rendered(&mut solid, &mut dashed, &lapel, &side_frame);
             // Gorge seam (drawn once)
             if mirror {
