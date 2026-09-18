@@ -389,10 +389,6 @@ fn convert_flat_rgb(rgb: &RgbImage, opts: &FlatOptions) -> Result<FlatOutput> {
     let label_override = load_label_override();
     // Per-chain labels, parallel to `scaled` (for the Jev prototype dump).
     let mut labels: Vec<&str> = Vec::with_capacity(scaled.len());
-    // #20: Button positions as structural anchors for short-seam filtering.
-    // Buttons are in photo coordinates (unscaled); chains are also in photo
-    // coordinates at this stage (scaling happens later for the silhouette).
-    let button_pts: Vec<(f32, f32)> = buttons.iter().map(|b| (b.cx, b.cy)).collect();
     for (idx, c) in scaled.iter().enumerate() {
         let kind = match label_override
             .as_ref()
@@ -407,9 +403,9 @@ fn convert_flat_rgb(rgb: &RgbImage, opts: &FlatOptions) -> Result<FlatOutput> {
                 eprintln!(
                     "IM2VEC_LABELS_JSON: unknown label '{other}' for chain {idx}, using heuristic"
                 );
-                classify_chain(c, &edge_band, rgb, w as usize, h as usize, &button_pts)
+                classify_chain(c, &edge_band, rgb, w as usize, h as usize)
             }
-            None => classify_chain(c, &edge_band, rgb, w as usize, h as usize, &button_pts),
+            None => classify_chain(c, &edge_band, rgb, w as usize, h as usize),
         };
         labels.push(match kind {
             ChainKind::Seam => "seam",
@@ -1970,17 +1966,17 @@ fn classify_chain(
     rgb: &RgbImage,
     w: usize,
     h: usize,
-    buttons: &[(f32, f32)],
 ) -> ChainKind {
     let len = arc_len(c);
     let straight = straightness(c);
     let (_, bright_frac) = chain_brightness(c, rgb, w, h);
     let edge_frac = chain_edge_frac(c, edge_band, w, h);
-    // Seam: long + straight structural lines, or medium + very straight +
-    // dark near-miss seams (front edges, plackets).
-    let mut kind = if (len > 90.0 && straight > 0.85)
-        || (len > 45.0 && straight > 0.95 && bright_frac < 0.35)
-    {
+    // Seam: long + straight structural lines only (#20 retuning).
+    // Phase 6 templates now provide lapels/pockets/collar; the chain
+    // classifier is retuned for recall of LONG structure only. The
+    // medium-seam exception (45px) is removed — those fragments are
+    // now covered by templates or are spurious.
+    if len > 90.0 && straight > 0.85 {
         ChainKind::Seam
     } else if len < 25.0 {
         // Sample brightness: white stitching (L>130) vs blue denim (L~110-120).
@@ -1999,32 +1995,7 @@ fn classify_chain(
         ChainKind::Stitch
     } else {
         ChainKind::Fold
-    };
-
-    // #20: Demote short seams far from structural anchors.
-    // Short chains (<60px) classified as Seam are often wrinkle/shadow
-    // artifacts. Require them to be near a button (structural anchor);
-    // otherwise demote to Noise. This improves precision without hurting
-    // recall of long structural lines.
-    if kind == ChainKind::Seam && len < 60.0 && !buttons.is_empty() {
-        let (cx, cy) = {
-            let n = c.len() as f32;
-            let (sx, sy) = c
-                .iter()
-                .fold((0.0, 0.0), |(ax, ay), (x, y)| (ax + x, ay + y));
-            (sx / n, sy / n)
-        };
-        let near_button = buttons.iter().any(|(bx, by)| {
-            let dx = cx - bx;
-            let dy = cy - by;
-            dx * dx + dy * dy < 100.0 * 100.0
-        });
-        if !near_button {
-            kind = ChainKind::Noise;
-        }
     }
-
-    kind
 }
 
 /// Prototype-only: load a per-chain label override from
