@@ -1983,9 +1983,11 @@ fn classify_chain(
         // Note: chains sit on stitch edges, so sample is mixed; threshold low.
         let is_bright = bright_frac >= 0.5;
         // Near-edge short chains = photo topstitching (hem/cuff/front edge).
+        // #20: Require near-edge (drop the straightness OR) — interior
+        // bright fragments are noise, not stitching. Phase 6 + procedural
+        // stitching cover the true topstitching.
         let near_edge = edge_frac >= 0.5;
-        // Bright + (near edge OR linear) = stitching; else texture.
-        if is_bright && (near_edge || straight > 0.7) {
+        if is_bright && near_edge {
             ChainKind::Stitch
         } else {
             ChainKind::Noise
