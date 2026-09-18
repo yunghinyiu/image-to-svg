@@ -389,6 +389,10 @@ fn convert_flat_rgb(rgb: &RgbImage, opts: &FlatOptions) -> Result<FlatOutput> {
     let label_override = load_label_override();
     // Per-chain labels, parallel to `scaled` (for the Jev prototype dump).
     let mut labels: Vec<&str> = Vec::with_capacity(scaled.len());
+    // #20: Button positions as structural anchors for short-seam filtering.
+    // Buttons are in photo coordinates (unscaled); chains are also in photo
+    // coordinates at this stage (scaling happens later for the silhouette).
+    let button_pts: Vec<(f32, f32)> = buttons.iter().map(|b| (b.cx, b.cy)).collect();
     for (idx, c) in scaled.iter().enumerate() {
         let kind = match label_override
             .as_ref()
@@ -403,9 +407,9 @@ fn convert_flat_rgb(rgb: &RgbImage, opts: &FlatOptions) -> Result<FlatOutput> {
                 eprintln!(
                     "IM2VEC_LABELS_JSON: unknown label '{other}' for chain {idx}, using heuristic"
                 );
-                classify_chain(c, &edge_band, rgb, w as usize, h as usize)
+                classify_chain(c, &edge_band, rgb, w as usize, h as usize, &button_pts)
             }
-            None => classify_chain(c, &edge_band, rgb, w as usize, h as usize),
+            None => classify_chain(c, &edge_band, rgb, w as usize, h as usize, &button_pts),
         };
         labels.push(match kind {
             ChainKind::Seam => "seam",
@@ -487,6 +491,28 @@ fn convert_flat_rgb(rgb: &RgbImage, opts: &FlatOptions) -> Result<FlatOutput> {
         svg.push_str("\"/>");
     }
     svg.push_str("</g>");
+    // Phase 6: parametric structural linework (lapels, collar, pockets).
+    // Solid edges in <g id="structure">, dashed details get per-path dash.
+    let (struct_solid, struct_dashed) = generate_structure(&buttons, &comps);
+    if !struct_solid.is_empty() || !struct_dashed.is_empty() {
+        svg.push_str("<g id=\"structure\" fill=\"none\" stroke=\"#1a1a1a\" stroke-width=\"2\" stroke-linecap=\"round\" stroke-linejoin=\"round\">");
+        for p in &struct_solid {
+            svg.push_str(&format!("<path d=\"M{:.1},{:.1}", p[0].0, p[0].1));
+            for &(px, py) in &p[1..] {
+                svg.push_str(&format!("L{:.1},{:.1}", px, py));
+            }
+            svg.push_str("\"/>");
+        }
+        for p in &struct_dashed {
+            svg.push_str(&format!("<path d=\"M{:.1},{:.1}", p[0].0, p[0].1));
+            for &(px, py) in &p[1..] {
+                svg.push_str(&format!("L{:.1},{:.1}", px, py));
+            }
+            svg.push_str("\" stroke-dasharray=\"7 4\"/>");
+        }
+        svg.push_str("</g>");
+        n_det += struct_solid.len() + struct_dashed.len();
+    }
     // Phase 4: standardized button symbols. One symbol in <defs> (outer
     // ring + 4-hole dots, reference proportions: ring r = 9.4px at 1536px
     // wide, holes at +/-0.21r, hole r = 0.13r, all detached so the ring
@@ -1944,6 +1970,7 @@ fn classify_chain(
     rgb: &RgbImage,
     w: usize,
     h: usize,
+    buttons: &[(f32, f32)],
 ) -> ChainKind {
     let len = arc_len(c);
     let straight = straightness(c);
@@ -1951,10 +1978,11 @@ fn classify_chain(
     let edge_frac = chain_edge_frac(c, edge_band, w, h);
     // Seam: long + straight structural lines, or medium + very straight +
     // dark near-miss seams (front edges, plackets).
-    if (len > 90.0 && straight > 0.85) || (len > 45.0 && straight > 0.95 && bright_frac < 0.35) {
-        return ChainKind::Seam;
-    }
-    if len < 25.0 {
+    let mut kind = if (len > 90.0 && straight > 0.85)
+        || (len > 45.0 && straight > 0.95 && bright_frac < 0.35)
+    {
+        ChainKind::Seam
+    } else if len < 25.0 {
         // Sample brightness: white stitching (L>130) vs blue denim (L~110-120).
         // Note: chains sit on stitch edges, so sample is mixed; threshold low.
         let is_bright = bright_frac >= 0.5;
@@ -1962,15 +1990,41 @@ fn classify_chain(
         let near_edge = edge_frac >= 0.5;
         // Bright + (near edge OR linear) = stitching; else texture.
         if is_bright && (near_edge || straight > 0.7) {
-            return ChainKind::Stitch;
+            ChainKind::Stitch
+        } else {
+            ChainKind::Noise
         }
-        return ChainKind::Noise;
+    } else if bright_frac >= 0.4 && edge_frac >= 0.6 {
+        // Medium-length bright chains hugging the silhouette edge are topstitching.
+        ChainKind::Stitch
+    } else {
+        ChainKind::Fold
+    };
+
+    // #20: Demote short seams far from structural anchors.
+    // Short chains (<60px) classified as Seam are often wrinkle/shadow
+    // artifacts. Require them to be near a button (structural anchor);
+    // otherwise demote to Noise. This improves precision without hurting
+    // recall of long structural lines.
+    if kind == ChainKind::Seam && len < 60.0 && !buttons.is_empty() {
+        let (cx, cy) = {
+            let n = c.len() as f32;
+            let (sx, sy) = c
+                .iter()
+                .fold((0.0, 0.0), |(ax, ay), (x, y)| (ax + x, ay + y));
+            (sx / n, sy / n)
+        };
+        let near_button = buttons.iter().any(|(bx, by)| {
+            let dx = cx - bx;
+            let dy = cy - by;
+            dx * dx + dy * dy < 100.0 * 100.0
+        });
+        if !near_button {
+            kind = ChainKind::Noise;
+        }
     }
-    // Medium-length bright chains hugging the silhouette edge are topstitching.
-    if bright_frac >= 0.4 && edge_frac >= 0.6 {
-        return ChainKind::Stitch;
-    }
-    ChainKind::Fold
+
+    kind
 }
 
 /// Prototype-only: load a per-chain label override from
@@ -2042,6 +2096,282 @@ fn dump_chain_features(
     if let Err(e) = std::fs::write(path, out) {
         eprintln!("IM2VEC_DUMP_CHAINS: failed to write {path}: {e}");
     }
+}
+
+/// Center front x from the buttons inside a view bbox: average the midpoint
+/// of each button row (rows = buttons within 30px in y). A plain median of x
+/// fails for an even two-column double-breasted layout — it picks the upper
+/// column instead of the middle.
+fn center_front(buttons: &[Button], x0: f32, y0: f32, x1: f32, y1: f32) -> Option<f32> {
+    let mut fby: Vec<&Button> = buttons
+        .iter()
+        .filter(|b| b.cx >= x0 && b.cx <= x1 && b.cy >= y0 && b.cy <= y1)
+        .collect();
+    if fby.is_empty() {
+        return None;
+    }
+    fby.sort_by(|a, b| a.cy.partial_cmp(&b.cy).unwrap());
+    // rows: (running mean y, button xs)
+    let mut rows: Vec<(f32, Vec<f32>)> = Vec::new();
+    for b in fby {
+        match rows.last_mut() {
+            Some((ry, xs)) if (b.cy - *ry).abs() <= 30.0 => {
+                *ry = (*ry * xs.len() as f32 + b.cy) / (xs.len() + 1) as f32;
+                xs.push(b.cx);
+            }
+            _ => rows.push((b.cy, vec![b.cx])),
+        }
+    }
+    Some(
+        rows.iter()
+            .map(|(_, xs)| xs.iter().sum::<f32>() / xs.len() as f32)
+            .sum::<f32>()
+            / rows.len() as f32,
+    )
+}
+/// Phase 6: parametric structural linework (lapels, collar, pockets).
+/// The chain classifier can only keep/discard photo-traced chains; it cannot
+/// invent a lapel. This generates artist-plausible structure from landmarks:
+/// front buttons (center front + closure point) and view bounding boxes.
+///
+/// Returns (solid_paths, dashed_paths): lapel/collar edges are solid 2px,
+/// pocket topstitching and back-seam details are dashed.
+type StructurePaths = (Vec<Vec<(f32, f32)>>, Vec<Vec<(f32, f32)>>);
+
+fn generate_structure(buttons: &[Button], comps: &[Component]) -> StructurePaths {
+    let mut solid = Vec::new();
+    let mut dashed = Vec::new();
+
+    // Identify views: front = component with the most buttons (the 2-column
+    // front closure); back = the other large component; sleeve = narrow.
+    let mut front_idx: Option<usize> = None;
+    let mut back_idx: Option<usize> = None;
+    let mut best_count = 0;
+    for (i, comp) in comps.iter().enumerate().skip(1) {
+        let w = comp.x1.saturating_sub(comp.x0) as f32;
+        let h = comp.y1.saturating_sub(comp.y0) as f32;
+        if w < 50.0 || h < 100.0 {
+            continue;
+        }
+        let n = buttons
+            .iter()
+            .filter(|b| {
+                b.cx >= comp.x0 as f32
+                    && b.cx <= comp.x1 as f32
+                    && b.cy >= comp.y0 as f32
+                    && b.cy <= comp.y1 as f32
+            })
+            .count();
+        if n > best_count {
+            best_count = n;
+            front_idx = Some(i);
+        }
+    }
+    // Back = largest remaining component with aspect like front (not a sleeve).
+    if let Some(fi) = front_idx {
+        let fw = comps[fi].x1.saturating_sub(comps[fi].x0) as f32;
+        let mut best_area = 0usize;
+        for (i, comp) in comps.iter().enumerate().skip(1) {
+            if i == fi {
+                continue;
+            }
+            let w = comp.x1.saturating_sub(comp.x0) as f32;
+            if w < fw * 0.6 {
+                continue; // sleeve/detail view
+            }
+            if comp.area > best_area {
+                best_area = comp.area;
+                back_idx = Some(i);
+            }
+        }
+    }
+
+    // Front view: lapels, collar, pockets.
+    if let Some(fi) = front_idx {
+        let c = &comps[fi];
+        let (x0, y0, x1, y1) = (c.x0 as f32, c.y0 as f32, c.x1 as f32, c.y1 as f32);
+        let w = x1 - x0;
+        let h = y1 - y0;
+        // Center front from front buttons (row-midpoint average; see
+        // center_front). Bail if no plausible front-button group.
+        let cx = match center_front(buttons, x0, y0, x1, y1) {
+            Some(cx) => cx,
+            None => return (solid, dashed),
+        };
+        // Top button row y (min y of front buttons).
+        let y_button = buttons
+            .iter()
+            .filter(|b| b.cx >= x0 && b.cx <= x1 && b.cy >= y0 && b.cy <= y1)
+            .map(|b| b.cy)
+            .fold(f32::INFINITY, f32::min);
+
+        // Landmarks (proportions measured from the reference tech pack).
+        let y_neck = y0 + 0.06 * h;
+        let y_gorge = y0 + 0.09 * h;
+        let gorge_dx = 0.14 * w;
+        let btn_dx = 0.09 * w;
+
+        // Lapels (mirrored): notch-lapel with sharp peak. The silhouette
+        // already includes the collar bump; we add the lapel panels.
+        // Reference: angular geometry — notch -> peak (sharp out) -> break.
+        let wide_dx = 0.25 * w;
+        let y_peak = y0 + 0.24 * h;
+        for side in [-1.0f32, 1.0] {
+            let notch = (cx + side * gorge_dx, y_gorge);
+            let peak = (cx + side * wide_dx, y_peak);
+            let brk = (cx + side * btn_dx, y_button);
+            // Outer edge: notch -> peak (straight), peak -> break (gentle curve).
+            // Sharp corner at the peak for the notch-lapel point.
+            solid.push(vec![notch, peak]);
+            let c1 = (peak.0, peak.1 + (brk.1 - peak.1) * 0.35);
+            let c2 = (
+                peak.0 + side * (brk.0 - peak.0) * 0.3,
+                brk.1 - (brk.1 - peak.1) * 0.25,
+            );
+            solid.push(sample_cubic(peak, c1, c2, brk, 16));
+            // Dashed topstitching parallel to the outer edge, inset ~9px.
+            dashed.push(vec![
+                (notch.0 - side * 9.0, notch.1 + 2.0),
+                (peak.0 - side * 9.0, peak.1),
+            ]);
+            let inset_c1 = (c1.0 - side * 9.0, c1.1);
+            let inset_c2 = (c2.0 - side * 9.0, c2.1);
+            let inset_brk = (brk.0 - side * 9.0, brk.1);
+            let inset_peak = (peak.0 - side * 9.0, peak.1);
+            dashed.push(sample_cubic(inset_peak, inset_c1, inset_c2, inset_brk, 16));
+            // Roll line: the V from neck to button.
+            solid.push(vec![
+                (cx + side * gorge_dx * 0.55, y_neck + 0.01 * h),
+                (cx + side * gorge_dx * 0.42, (y_neck + y_button) * 0.5),
+                (cx + side * btn_dx * 0.5, y_button - 4.0),
+            ]);
+            // Gorge seam: collar bottom edge from center to notch.
+            // (Drawn once per side, meets at center.)
+            if side < 0.0 {
+                solid.push(vec![
+                    (cx - gorge_dx, y_gorge),
+                    (cx, y_gorge - 0.008 * h),
+                    (cx + gorge_dx, y_gorge),
+                ]);
+            }
+        }
+
+        // Pocket flaps (mirrored): rounded rect + dashed topstitching.
+        let pocket_y = y0 + 0.73 * h;
+        let pocket_dx = 0.25 * w;
+        let (pw, ph) = (0.18 * w, 0.06 * h);
+        for side in [-1.0f32, 1.0] {
+            let pcx = cx + side * pocket_dx;
+            let mut rect = rounded_rect(pcx - pw / 2.0, pocket_y, pw, ph, 0.012 * w, 10);
+            // Explicitly close the loop.
+            if let Some(&p0) = rect.first() {
+                rect.push(p0);
+            }
+            solid.push(rect);
+            // Dashed stitching inset.
+            let inset = 5.0;
+            let mut stitch = rounded_rect(
+                pcx - pw / 2.0 + inset,
+                pocket_y + inset,
+                pw - 2.0 * inset,
+                ph - 2.0 * inset,
+                0.008 * w,
+                10,
+            );
+            if let Some(&p0) = stitch.first() {
+                stitch.push(p0);
+            }
+            dashed.push(stitch);
+        }
+    }
+
+    // Back view: collar band + center back seam.
+    if let Some(bi) = back_idx {
+        let c = &comps[bi];
+        let (x0, y0, x1, y1) = (c.x0 as f32, c.y0 as f32, c.x1 as f32, c.y1 as f32);
+        let w = x1 - x0;
+        let h = y1 - y0;
+        let cx = (x0 + x1) * 0.5;
+        let collar_dx = 0.15 * w;
+        let y_ct = y0 + 0.02 * h;
+        let y_cb = y0 + 0.09 * h;
+        // Collar top edge.
+        solid.push(vec![
+            (cx - collar_dx, y_ct + 0.008 * h),
+            (cx, y_ct),
+            (cx + collar_dx, y_ct + 0.008 * h),
+        ]);
+        // Collar bottom edge (gorge seam).
+        solid.push(vec![
+            (cx - collar_dx * 1.05, y_cb),
+            (cx, y_cb - 0.006 * h),
+            (cx + collar_dx * 1.05, y_cb),
+        ]);
+        // Collar sides.
+        solid.push(vec![
+            (cx - collar_dx, y_ct + 0.008 * h),
+            (cx - collar_dx * 1.05, y_cb),
+        ]);
+        solid.push(vec![
+            (cx + collar_dx, y_ct + 0.008 * h),
+            (cx + collar_dx * 1.05, y_cb),
+        ]);
+        // Dashed topstitching along collar bottom.
+        dashed.push(vec![
+            (cx - collar_dx * 1.05 + 4.0, y_cb - 5.0),
+            (cx, y_cb - 0.006 * h - 5.0),
+            (cx + collar_dx * 1.05 - 4.0, y_cb - 5.0),
+        ]);
+        // Center back seam (dashed).
+        dashed.push(vec![(cx, y_cb + 8.0), (cx, y1 - 0.05 * h)]);
+    }
+
+    (solid, dashed)
+}
+
+/// Sample a cubic Bezier curve into `n` points.
+fn sample_cubic(
+    p0: (f32, f32),
+    p1: (f32, f32),
+    p2: (f32, f32),
+    p3: (f32, f32),
+    n: usize,
+) -> Vec<(f32, f32)> {
+    (0..=n)
+        .map(|i| {
+            let t = i as f32 / n as f32;
+            let u = 1.0 - t;
+            (
+                u * u * u * p0.0
+                    + 3.0 * u * u * t * p1.0
+                    + 3.0 * u * t * t * p2.0
+                    + t * t * t * p3.0,
+                u * u * u * p0.1
+                    + 3.0 * u * u * t * p1.1
+                    + 3.0 * u * t * t * p2.1
+                    + t * t * t * p3.1,
+            )
+        })
+        .collect()
+}
+
+/// Rounded rectangle as a closed polyline (last point connects to first).
+fn rounded_rect(x: f32, y: f32, w: f32, h: f32, r: f32, seg: usize) -> Vec<(f32, f32)> {
+    let mut pts = Vec::new();
+    // (center_x, center_y, start_angle_deg): TR, BR, BL, TL.
+    let corners = [
+        (x + w - r, y + r, -90.0),
+        (x + w - r, y + h - r, 0.0),
+        (x + r, y + h - r, 90.0),
+        (x + r, y + r, 180.0),
+    ];
+    for (ccx, ccy, start_deg) in corners {
+        for i in 0..=seg {
+            let ang = (start_deg + i as f32 * 90.0 / seg as f32).to_radians();
+            pts.push((ccx + r * ang.cos(), ccy + r * ang.sin()));
+        }
+    }
+    pts
 }
 
 /// Generate procedural topstitching (dashed) as inward offsets of the
@@ -2894,5 +3224,181 @@ mod tests {
         assert!(worst < 1.0, "wiggle not smoothed, worst={worst:.2}");
         // Overall curve preserved: interior points near the arc.
         assert!((sm[50].1 - 0.01 * 50.0 * 50.0).abs() < 2.0);
+    }
+
+    #[test]
+    fn sample_cubic_endpoints_and_count() {
+        let p0 = (0.0, 0.0);
+        let p1 = (10.0, 0.0);
+        let p2 = (10.0, 10.0);
+        let p3 = (20.0, 10.0);
+        let pts = sample_cubic(p0, p1, p2, p3, 10);
+        assert_eq!(pts.len(), 11);
+        assert!((pts[0].0 - p0.0).abs() < 1e-5 && (pts[0].1 - p0.1).abs() < 1e-5);
+        assert!((pts[10].0 - p3.0).abs() < 1e-5 && (pts[10].1 - p3.1).abs() < 1e-5);
+        // Monotonic in x for this curve.
+        for w in pts.windows(2) {
+            assert!(w[1].0 >= w[0].0);
+        }
+    }
+
+    #[test]
+    fn rounded_rect_is_closed_loop() {
+        let pts = rounded_rect(0.0, 0.0, 100.0, 50.0, 10.0, 4);
+        // 4 corners * (4+1) points.
+        assert_eq!(pts.len(), 20);
+        // All points within the rect bounds.
+        for &(x, y) in &pts {
+            assert!((0.0..=100.0).contains(&x) && (0.0..=50.0).contains(&y));
+        }
+        // Starts at top edge, ends at top edge (needs explicit close by caller).
+        assert!((pts[0].1 - 0.0).abs() < 1e-4);
+    }
+
+    #[test]
+    fn center_front_averages_row_midpoints() {
+        // Double-breasted two-column layout: a plain median of x would pick
+        // 449 (upper column); the true center is ~411.5.
+        let buttons = vec![
+            Button {
+                cx: 360.5,
+                cy: 425.5,
+            },
+            Button {
+                cx: 463.0,
+                cy: 425.5,
+            },
+            Button {
+                cx: 373.0,
+                cy: 492.0,
+            },
+            Button {
+                cx: 451.5,
+                cy: 493.5,
+            },
+            Button {
+                cx: 373.0,
+                cy: 564.5,
+            },
+            Button {
+                cx: 449.0,
+                cy: 566.5,
+            },
+        ];
+        let cx = center_front(&buttons, 163.0, 127.0, 659.0, 711.0).unwrap();
+        assert!((cx - 411.5).abs() < 1.0, "cx={cx:.1}, want ~411.5");
+    }
+
+    #[test]
+    fn center_front_none_without_buttons_in_view() {
+        let buttons = vec![Button {
+            cx: 360.5,
+            cy: 425.5,
+        }];
+        assert!(center_front(&buttons, 978.0, 128.0, 1453.0, 710.0).is_none());
+    }
+
+    #[test]
+    fn generate_structure_finds_front_and_back() {
+        // Mock: front component with 6 buttons, back component, sleeve.
+        let comps = vec![
+            Component {
+                area: 0,
+                x0: 0,
+                y0: 0,
+                x1: 0,
+                y1: 0,
+                symmetrized: false,
+            },
+            Component {
+                area: 200000,
+                x0: 163,
+                y0: 127,
+                x1: 659,
+                y1: 711,
+                symmetrized: true,
+            },
+            Component {
+                area: 50000,
+                x0: 702,
+                y0: 123,
+                x1: 939,
+                y1: 742,
+                symmetrized: false,
+            },
+            Component {
+                area: 190000,
+                x0: 978,
+                y0: 128,
+                x1: 1453,
+                y1: 710,
+                symmetrized: true,
+            },
+        ];
+        let buttons = vec![
+            Button {
+                cx: 360.0,
+                cy: 425.0,
+            },
+            Button {
+                cx: 463.0,
+                cy: 425.0,
+            },
+            Button {
+                cx: 373.0,
+                cy: 492.0,
+            },
+            Button {
+                cx: 451.0,
+                cy: 493.0,
+            },
+            Button {
+                cx: 373.0,
+                cy: 564.0,
+            },
+            Button {
+                cx: 449.0,
+                cy: 566.0,
+            },
+        ];
+        let (solid, dashed) = generate_structure(&buttons, &comps);
+        // Front: 2 lapel edges + 2 roll lines + 1 gorge + 2 notch ticks (in edge)
+        //        + 2 pockets = ~9 solid; back: collar (4) = 4 solid.
+        // Dashed: 2 lapel stitch + 2 pocket stitch + 1 collar stitch + 1 back seam.
+        assert!(!solid.is_empty(), "no solid structure paths");
+        assert!(!dashed.is_empty(), "no dashed structure paths");
+        // All points within the view bboxes (with margin).
+        for p in solid.iter().chain(dashed.iter()) {
+            for &(x, y) in p {
+                assert!(
+                    (100.0..=1500.0).contains(&x) && (100.0..=750.0).contains(&y),
+                    "structure point out of bounds: ({x:.1},{y:.1})"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn generate_structure_empty_without_buttons() {
+        let comps = vec![
+            Component {
+                area: 0,
+                x0: 0,
+                y0: 0,
+                x1: 0,
+                y1: 0,
+                symmetrized: false,
+            },
+            Component {
+                area: 200000,
+                x0: 163,
+                y0: 127,
+                x1: 659,
+                y1: 711,
+                symmetrized: true,
+            },
+        ];
+        let (solid, dashed) = generate_structure(&[], &comps);
+        assert!(solid.is_empty() && dashed.is_empty());
     }
 }
