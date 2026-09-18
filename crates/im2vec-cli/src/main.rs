@@ -95,6 +95,7 @@ fn main() -> Result<()> {
             outline_width: args.outline_width,
             detail_strength: args.detail_strength,
             speckle: args.filter_speckle,
+            proportion_compensation: (1.18, 1.27),
         };
         let out = im2vec_flat::convert_flat_bytes(&bytes, &flat)?;
         std::fs::write(&args.output, &out.svg)
