@@ -27,7 +27,7 @@ pub mod shading;
 mod template;
 use template::{
     back_collar_template, front_collar_template, gorge_seam_template, lapel_template_with_peak,
-    pocket_template, render_template, Placement, Template,
+    neckline_template, pocket_template, render_template, Placement, Template,
 };
 
 /// Max image side in px; larger inputs are downscaled for speed.
@@ -2245,49 +2245,17 @@ fn generate_structure(
     let mut solid = Vec::new();
     let mut dashed = Vec::new();
 
-    // Identify views: front = component with the most buttons (the 2-column
-    // front closure); back = the other large component; sleeve = narrow.
-    let mut front_idx: Option<usize> = None;
-    let mut back_idx: Option<usize> = None;
-    let mut best_count = 0;
-    for (i, comp) in comps.iter().enumerate().skip(1) {
-        let w = comp.x1.saturating_sub(comp.x0) as f32;
-        let h = comp.y1.saturating_sub(comp.y0) as f32;
-        if w < 50.0 || h < 100.0 {
-            continue;
-        }
-        let n = buttons
-            .iter()
-            .filter(|b| {
-                b.cx >= comp.x0 as f32
-                    && b.cx <= comp.x1 as f32
-                    && b.cy >= comp.y0 as f32
-                    && b.cy <= comp.y1 as f32
-            })
-            .count();
-        if n > best_count {
-            best_count = n;
-            front_idx = Some(i);
-        }
-    }
-    // Back = largest remaining component with aspect like front (not a sleeve).
-    if let Some(fi) = front_idx {
-        let fw = comps[fi].x1.saturating_sub(comps[fi].x0) as f32;
-        let mut best_area = 0usize;
-        for (i, comp) in comps.iter().enumerate().skip(1) {
-            if i == fi {
-                continue;
-            }
-            let w = comp.x1.saturating_sub(comp.x0) as f32;
-            if w < fw * 0.6 {
-                continue; // sleeve/detail view
-            }
-            if comp.area > best_area {
-                best_area = comp.area;
-                back_idx = Some(i);
-            }
-        }
-    }
+    // Identify views by garment-agnostic evidence: buttons are strong
+    // evidence when present but not required, so buttonless garments
+    // (tees, dresses) still get a front view from symmetry, neckline
+    // chains, and relative size.
+    let bboxes: Vec<(f32, f32, f32, f32, usize)> = comps
+        .iter()
+        .map(|c| (c.x0 as f32, c.y0 as f32, c.x1 as f32, c.y1 as f32, c.area))
+        .collect();
+    let button_pts: Vec<(f32, f32)> = buttons.iter().map(|b| (b.cx, b.cy)).collect();
+    let (front_idx, back_idx) =
+        detect::identify_views(&bboxes, &button_pts, chains, mask, img_w, img_h);
 
     // Front view: lapels, collar, pockets — via #28 Template/Placement.
     // Landmarks stay here; template shapes live in template.rs and render
@@ -2311,8 +2279,16 @@ fn generate_structure(
             .filter(|b| b.cx >= x0 && b.cx <= x1 && b.cy >= y0 && b.cy <= y1)
             .map(|b| (b.cx, b.cy))
             .collect();
-        let cx = match detect::closure_center(&detect::detect_button_columns(&front_pts, &view)) {
+        let columns = detect::detect_button_columns(&front_pts, &view);
+        let axis = detect::refine_axis_from_mask(mask, img_w, img_h, &view);
+        let closure = detect::closure_center(&columns);
+        let cx = match closure {
             Some(cx) => cx,
+            // Buttonless garment: fall back to the mask axis. The neckline
+            // structure below is still photo-driven; lapels and pockets
+            // need closure evidence and stay gated.
+            None if columns.is_empty() => axis,
+            // Ambiguous multi-column layout: bail rather than guess.
             None => return (solid, dashed),
         };
         // Top button row y (min y of front buttons).
@@ -2455,6 +2431,34 @@ fn generate_structure(
                     mirror: false,
                 };
                 push_rendered(&mut solid, &mut dashed, &pocket, &pocket_frame);
+            }
+        }
+
+        // Buttonless fronts: neckline/collar structure traced from the
+        // photo. Buttoned garments take the lapel/pocket path above instead.
+        // Rendered only when the detector fires — no phantom necklines.
+        if closure.is_none() {
+            let neckline = detect::detect_neckline(chains, &view)
+                .filter(|n| n.confidence >= detect::DETECT_CONFIDENCE_MIN);
+            if std::env::var("IM2VEC_FLAT_DEBUG").is_ok() {
+                match neckline {
+                    Some(n) => eprintln!(
+                        "[detect] neckline y={:.1} x={:.0}-{:.0} depth={:.0} (conf {:.2})",
+                        n.y, n.x0, n.x1, n.depth, n.confidence
+                    ),
+                    None => eprintln!("[detect] no neckline — skipping neckline template"),
+                }
+            }
+            if let Some(n) = neckline {
+                let t = neckline_template((n.x1 - n.x0) / (2.0 * w), n.depth / h);
+                let frame = Placement {
+                    ax: (n.x0 + n.x1) * 0.5,
+                    ay: n.y,
+                    w,
+                    h,
+                    mirror: false,
+                };
+                push_rendered(&mut solid, &mut dashed, &t, &frame);
             }
         }
     }
@@ -3443,5 +3447,60 @@ mod tests {
         let mask = vec![false; 1600 * 900];
         let (solid, dashed) = generate_structure(&[], &comps, &[], 1600, 900, &mask, &dummy_map);
         assert!(solid.is_empty() && dashed.is_empty());
+    }
+
+    #[test]
+    fn generate_structure_buttonless_renders_neckline() {
+        // Synthetic buttonless tee: one large symmetric comp, bowed
+        // neckline chains in its upper region, no buttons at all.
+        let comps = vec![
+            Component {
+                area: 0,
+                x0: 0,
+                y0: 0,
+                x1: 0,
+                y1: 0,
+                symmetrized: false,
+            },
+            Component {
+                area: 200000,
+                x0: 100,
+                y0: 100,
+                x1: 500,
+                y1: 700,
+                symmetrized: false,
+            },
+        ];
+        let mut mask = vec![false; 1600 * 900];
+        for y in 100..700 {
+            for x in 100..500 {
+                mask[y * 1600 + x] = true;
+            }
+        }
+        let mut chains: Vec<Vec<(f32, f32)>> = Vec::new();
+        for s in [0, 1] {
+            let mut c = Vec::new();
+            for i in 0..=14 {
+                let x = 180.0 + i as f32 * 10.0 + s as f32 * 5.0;
+                let y = 135.0 + ((x - 250.0) / 70.0).powi(2) * 15.0 + s as f32 * 3.0;
+                c.push((x, y));
+            }
+            chains.push(c);
+        }
+        let dummy_curv = vec![0.0f32; 1600 * 900];
+        let dummy_map = shading::CurvatureMap::new(dummy_curv, 1600, 900);
+        let (solid, _dashed) =
+            generate_structure(&[], &comps, &chains, 1600, 900, &mask, &dummy_map);
+        assert!(
+            !solid.is_empty(),
+            "buttonless front should render a neckline"
+        );
+        // Neckline paths sit near the detected seam row (y ~141).
+        let near = solid
+            .iter()
+            .flat_map(|p| p.iter())
+            .filter(|&&(_, y)| (y - 141.0).abs() < 40.0)
+            .count();
+        assert!(near > 0, "no neckline points near y=141");
     }
 }

@@ -357,7 +357,18 @@ fn cluster_seam_candidates(
     horizontal: bool,
     min_len: f32,
 ) -> Vec<SeamCandidate> {
-    let feats = chain_features(chains);
+    rank_seam_candidates(&chain_features(chains), view, horizontal, min_len)
+}
+
+/// Seam ranking over precomputed chain features: filter to the view, then
+/// cluster by position along the seam normal. Split out so view scoring can
+/// rank several sub-regions without recomputing features.
+fn rank_seam_candidates(
+    feats: &[ChainFeat],
+    view: &ViewContext,
+    horizontal: bool,
+    min_len: f32,
+) -> Vec<SeamCandidate> {
     let span = if horizontal { view.w() } else { view.h() };
     if span <= 0.0 {
         return Vec::new();
@@ -466,6 +477,165 @@ pub fn detect_vertical_seams(
     min_len: f32,
 ) -> Vec<SeamCandidate> {
     cluster_seam_candidates(chains, view, false, min_len)
+}
+
+/// Foreground symmetry about x=`axis` within the bbox: 1.0 = perfectly
+/// mirrored, 0.0 = all foreground on one side (or empty). Compares
+/// foreground pixel counts left vs right of the axis, row by row, weighted
+/// by row foreground count so sparse rows do not dominate.
+fn mask_symmetry(mask: &[bool], w: usize, h: usize, bbox: (f32, f32, f32, f32), axis: f32) -> f32 {
+    let (x0, y0, x1, y1) = bbox;
+    if w == 0 || h == 0 || mask.len() < w * h {
+        return 0.0;
+    }
+    let y_lo = (y0.max(0.0) as usize).min(h);
+    let y_hi = (y1.min(h as f32) as usize).min(h);
+    let x_lo = (x0.max(0.0) as usize).min(w);
+    let x_hi = (x1.min(w as f32) as usize).min(w);
+    if y_lo >= y_hi || x_lo >= x_hi {
+        return 0.0;
+    }
+    let xai = (axis.clamp(x0, x1) as usize).clamp(x_lo, x_hi);
+    let (mut sym_sum, mut wsum) = (0.0f32, 0.0f32);
+    for y in y_lo..y_hi {
+        let row = y * w;
+        let mut left = 0u32;
+        let mut right = 0u32;
+        for x in x_lo..xai {
+            if mask[row + x] {
+                left += 1;
+            }
+        }
+        for x in xai..x_hi {
+            if mask[row + x] {
+                right += 1;
+            }
+        }
+        let tot = left + right;
+        if tot > 0 {
+            let s = 1.0 - (left as f32 - right as f32).abs() / tot as f32;
+            sym_sum += s * tot as f32;
+            wsum += tot as f32;
+        }
+    }
+    if wsum <= 0.0 {
+        0.0
+    } else {
+        sym_sum / wsum
+    }
+}
+
+/// Identify (front, back) view component indices from garment-agnostic
+/// evidence. Buttons are strong evidence when present but not required:
+/// a buttonless garment (tee, dress) still gets a front view from mask
+/// symmetry, neckline chain evidence, and relative size. `comps` are
+/// (x0, y0, x1, y1, area) with index 0 unused; either return may be None.
+pub fn identify_views(
+    comps: &[(f32, f32, f32, f32, usize)],
+    button_pts: &[(f32, f32)],
+    chains: &[Vec<(f32, f32)>],
+    mask: &[bool],
+    w: usize,
+    h: usize,
+) -> (Option<usize>, Option<usize>) {
+    let feats = chain_features(chains);
+    let max_area = comps.iter().skip(1).map(|c| c.4).max().unwrap_or(1).max(1) as f32;
+    let mut best: Option<(usize, f32)> = None;
+    for (i, &(x0, y0, x1, y1, area)) in comps.iter().enumerate().skip(1) {
+        let cw = x1 - x0;
+        let ch = y1 - y0;
+        if cw < 50.0 || ch < 100.0 {
+            continue;
+        }
+        let n_btn = button_pts
+            .iter()
+            .filter(|&&(bx, by)| bx >= x0 && bx <= x1 && by >= y0 && by <= y1)
+            .count();
+        let button_score = (n_btn.min(6) as f32) / 6.0;
+        let sym = mask_symmetry(mask, w, h, (x0, y0, x1, y1), (x0 + x1) * 0.5);
+        // Neckline evidence: strongest horizontal seam in the upper 30%.
+        let upper = ViewContext::new(x0, y0, x1, y0 + 0.30 * ch);
+        let neck = rank_seam_candidates(&feats, &upper, true, 40.0)
+            .into_iter()
+            .next()
+            .map(|c| c.confidence)
+            .unwrap_or(0.0);
+        let size = area as f32 / max_area;
+        let score = 0.40 * button_score + 0.25 * sym + 0.20 * neck + 0.15 * size;
+        if best.is_none_or(|(_, s)| score > s) {
+            best = Some((i, score));
+        }
+    }
+    let front_idx = best.filter(|&(_, s)| s >= 0.10).map(|(i, _)| i);
+    // Back = largest remaining component with aspect like front (not a sleeve).
+    let mut back_idx = None;
+    if let Some(fi) = front_idx {
+        let fw = comps[fi].2 - comps[fi].0;
+        let mut best_area = 0usize;
+        for (i, &(x0, _, x1, _, area)) in comps.iter().enumerate().skip(1) {
+            if i == fi {
+                continue;
+            }
+            if x1 - x0 < fw * 0.6 {
+                continue; // sleeve/detail view
+            }
+            if area > best_area {
+                best_area = area;
+                back_idx = Some(i);
+            }
+        }
+    }
+    (front_idx, back_idx)
+}
+
+/// A detected neckline: seam row, photo-measured extent, bow depth, and
+/// confidence. Everything positional comes from the XDoG chains.
+#[derive(Clone, Copy, Debug)]
+pub struct Neckline {
+    pub y: f32,
+    pub x0: f32,
+    pub x1: f32,
+    /// Bow depth below `y` in px (>= 0), measured from the chains.
+    pub depth: f32,
+    pub confidence: f32,
+}
+
+/// Neckline (collar seam) for buttonless fronts: the strongest horizontal
+/// seam candidate in the view's upper region. Rejects straight yoke-like
+/// seams via the bow gate — a real neckline always curves downward.
+pub fn detect_neckline(chains: &[Vec<(f32, f32)>], view: &ViewContext) -> Option<Neckline> {
+    let upper = ViewContext::new(view.x0, view.y0, view.x1, view.y0 + 0.30 * view.h());
+    let best = detect_horizontal_seams(chains, &upper, 40.0)
+        .into_iter()
+        .next()?;
+    let x0 = best.lo.max(view.x0);
+    let x1 = best.hi.min(view.x1);
+    if x1 - x0 < 0.12 * view.w() {
+        return None; // too narrow to be a neckline
+    }
+    // Bow depth: deepest chain point within the extent near the seam row.
+    let mut depth = 0.0f32;
+    for c in chains {
+        let mut cmax = f32::NEG_INFINITY;
+        for &(x, y) in c {
+            if x >= x0 && x <= x1 && (y - best.pos).abs() <= 25.0 {
+                cmax = cmax.max(y);
+            }
+        }
+        if cmax.is_finite() {
+            depth = depth.max((cmax - best.pos).max(0.0));
+        }
+    }
+    if depth < 2.0 {
+        return None; // straight seam, not a neckline
+    }
+    Some(Neckline {
+        y: best.pos,
+        x0,
+        x1,
+        depth: depth.min(0.25 * view.h()),
+        confidence: best.confidence,
+    })
 }
 
 /// One column of closure buttons (a placket column): x position plus the
@@ -760,5 +930,124 @@ mod tests {
         assert_eq!(cols.len(), 3);
         assert!(closure_center(&cols).is_none());
         assert!(closure_center(&[]).is_none());
+    }
+
+    // ---- #41: buttonless garment support ----
+
+    /// Fill a rect in a fresh mask.
+    fn fill_rect(w: usize, h: usize, x0: usize, x1: usize, y0: usize, y1: usize) -> Vec<bool> {
+        let mut m = vec![false; w * h];
+        for y in y0..y1.min(h) {
+            for x in x0..x1.min(w) {
+                m[y * w + x] = true;
+            }
+        }
+        m
+    }
+
+    /// Bowed crew-neckline chains: y ~135 at center, ~150 at the edges.
+    fn crew_chains() -> Vec<Vec<(f32, f32)>> {
+        let mut chains = Vec::new();
+        for s in [0, 1] {
+            let mut c = Vec::new();
+            for i in 0..=14 {
+                let x = 180.0 + i as f32 * 10.0 + s as f32 * 5.0;
+                let y = 135.0 + ((x - 250.0) / 70.0).powi(2) * 15.0 + s as f32 * 3.0;
+                c.push((x, y));
+            }
+            chains.push(c);
+        }
+        chains
+    }
+
+    #[test]
+    fn mask_symmetry_perfect_and_degenerate() {
+        let w = 100;
+        let h = 100;
+        let m = fill_rect(w, h, 20, 80, 10, 90);
+        let s = mask_symmetry(&m, w, h, (20.0, 10.0, 80.0, 90.0), 50.0);
+        assert!(s > 0.99, "sym={s}");
+        let e = vec![false; w * h];
+        assert_eq!(mask_symmetry(&e, w, h, (20.0, 10.0, 80.0, 90.0), 50.0), 0.0);
+        let o = fill_rect(w, h, 20, 50, 10, 90);
+        let s2 = mask_symmetry(&o, w, h, (20.0, 10.0, 80.0, 90.0), 50.0);
+        assert!(s2 < 0.05, "sym={s2}");
+    }
+
+    #[test]
+    fn identify_views_picks_buttoned_front() {
+        let comps = vec![
+            (0.0, 0.0, 0.0, 0.0, 0usize),
+            (100.0, 100.0, 500.0, 700.0, 200000),
+            (600.0, 100.0, 1000.0, 700.0, 190000),
+        ];
+        let buttons = vec![
+            (200.0, 300.0),
+            (300.0, 300.0),
+            (200.0, 400.0),
+            (300.0, 400.0),
+        ];
+        let mask = fill_rect(1100, 800, 100, 500, 100, 700);
+        let (front, back) = identify_views(&comps, &buttons, &[], &mask, 1100, 800);
+        assert_eq!(front, Some(1));
+        assert_eq!(back, Some(2));
+    }
+
+    #[test]
+    fn identify_views_finds_front_without_buttons() {
+        // Buttonless tee: two symmetric comps; only the first has neckline chains.
+        let comps = vec![
+            (0.0, 0.0, 0.0, 0.0, 0usize),
+            (100.0, 100.0, 500.0, 700.0, 200000),
+            (600.0, 100.0, 1000.0, 700.0, 195000),
+        ];
+        let chains = crew_chains();
+        let mut mask = fill_rect(1100, 800, 100, 500, 100, 700);
+        for y in 100..700 {
+            for x in 600..1000 {
+                mask[y * 1100 + x] = true;
+            }
+        }
+        let (front, back) = identify_views(&comps, &[], &chains, &mask, 1100, 800);
+        assert_eq!(front, Some(1), "neckline evidence should pick comp 1");
+        assert_eq!(back, Some(2));
+    }
+
+    #[test]
+    fn identify_views_none_when_nothing_qualifies() {
+        let comps = vec![(0.0, 0.0, 0.0, 0.0, 0usize), (10.0, 10.0, 30.0, 40.0, 500)];
+        let mask = vec![false; 100 * 100];
+        let (front, back) = identify_views(&comps, &[], &[], &mask, 100, 100);
+        assert_eq!(front, None);
+        assert_eq!(back, None);
+    }
+
+    #[test]
+    fn detect_neckline_finds_crew() {
+        let view = ViewContext::new(100.0, 100.0, 500.0, 700.0);
+        let nl = detect_neckline(&crew_chains(), &view).expect("neckline");
+        assert!((nl.y - 141.0).abs() < 8.0, "y={}", nl.y);
+        assert!((nl.x0 - 180.0).abs() < 15.0, "x0={}", nl.x0);
+        assert!((nl.x1 - 325.0).abs() < 15.0, "x1={}", nl.x1);
+        assert!(nl.depth > 5.0, "depth={}", nl.depth);
+        assert!(nl.confidence >= 0.5, "conf={}", nl.confidence);
+    }
+
+    #[test]
+    fn detect_neckline_rejects_straight_yoke() {
+        let view = ViewContext::new(100.0, 100.0, 500.0, 700.0);
+        let chains = vec![vec![
+            (180.0, 140.0),
+            (220.0, 140.0),
+            (260.0, 140.0),
+            (300.0, 140.0),
+        ]];
+        assert!(detect_neckline(&chains, &view).is_none());
+    }
+
+    #[test]
+    fn detect_neckline_none_without_chains() {
+        let view = ViewContext::new(100.0, 100.0, 500.0, 700.0);
+        assert!(detect_neckline(&[], &view).is_none());
     }
 }
