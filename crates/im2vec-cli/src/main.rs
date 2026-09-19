@@ -72,8 +72,8 @@ struct Args {
     /// flat preset only: also mirror the detail linework (off: logos/pockets stay put)
     #[arg(long, default_value_t = false, default_missing_value = "true", num_args(0..=1))]
     symmetrize_lines: bool,
-    /// flat preset only: silhouette outline stroke width in px
-    #[arg(long, default_value_t = 2.0)]
+    /// flat preset only: silhouette outline stroke width in px (0 = auto-derive from garment size)
+    #[arg(long, default_value_t = 0.0)]
     outline_width: f32,
     /// flat preset only: 0..=1, higher keeps weaker lines (fabric folds)
     #[arg(long, default_value_t = 0.6)]
