@@ -2437,8 +2437,14 @@ fn generate_structure(
         // Buttonless fronts: neckline/collar structure traced from the
         // photo. Buttoned garments take the lapel/pocket path above instead.
         // Rendered only when the detector fires — no phantom necklines.
-        if closure.is_none() {
-            let neckline = detect::detect_neckline(chains, &view)
+        // Bottoms (jeans/trousers: separated legs in the mask) have a
+        // waistband, not a neckline — skip so it isn't misread as one.
+        let is_bottom = detect::has_separated_legs(mask, img_w, img_h, &view);
+        if std::env::var("IM2VEC_FLAT_DEBUG").is_ok() && closure.is_none() {
+            eprintln!("[detect] separated legs (bottom garment): {is_bottom}");
+        }
+        if closure.is_none() && !is_bottom {
+            let neckline = detect::detect_neckline(chains, &view, mask, img_w, img_h)
                 .filter(|n| n.confidence >= detect::DETECT_CONFIDENCE_MIN);
             if std::env::var("IM2VEC_FLAT_DEBUG").is_ok() {
                 match neckline {
