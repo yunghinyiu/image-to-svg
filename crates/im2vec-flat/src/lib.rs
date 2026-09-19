@@ -22,6 +22,7 @@ use std::io::Cursor;
 use std::time::Instant;
 
 mod detect;
+mod mlp;
 mod search;
 pub mod shading;
 mod template;
@@ -414,7 +415,11 @@ fn convert_flat_rgb(rgb: &RgbImage, opts: &FlatOptions) -> Result<FlatOutput> {
             })
             .collect()
     };
-    let keep_folds = opts.detail_strength > 0.8;
+    // Folds (minor real structure) render as light detail lines by default.
+    // The distilled MLP promotes many heuristic-noise chains to fold; drawing
+    // them lightly (instead of dropping) recovers interior detail without the
+    // heavy ink of full-weight seams.
+    let keep_folds = opts.detail_strength > 0.3;
     // Edge band for stitch detection: pixels within 30px of silhouette boundary.
     // Short chains here are photo topstitching; elsewhere they're texture.
     let eroded = erode(&mask, w, h, 30);
@@ -513,17 +518,23 @@ fn convert_flat_rgb(rgb: &RgbImage, opts: &FlatOptions) -> Result<FlatOutput> {
         }
         svg.push_str("\"/>");
     }
-    for c in folds.iter() {
-        n_det += 1;
-        let (mx, my) = dpt(c[0].0, c[0].1);
-        svg.push_str(&format!("<path d=\"M{mx:.1},{my:.1}"));
-        for &(px, py) in &c[1..] {
-            let (lx, ly) = dpt(px, py);
-            svg.push_str(&format!("L{lx:.1},{ly:.1}"));
-        }
-        svg.push_str("\"/>");
-    }
     svg.push_str("</g>");
+    // Minor structure renders as light detail lines (separate group so they
+    // don't inherit the seam group's full-weight stroke).
+    if !folds.is_empty() {
+        svg.push_str("<g id=\"details\" fill=\"none\" stroke=\"#6b6b6b\" stroke-width=\"1\" stroke-linecap=\"round\" stroke-linejoin=\"round\">");
+        for c in folds.iter() {
+            n_det += 1;
+            let (mx, my) = dpt(c[0].0, c[0].1);
+            svg.push_str(&format!("<path d=\"M{mx:.1},{my:.1}"));
+            for &(px, py) in &c[1..] {
+                let (lx, ly) = dpt(px, py);
+                svg.push_str(&format!("L{lx:.1},{ly:.1}"));
+            }
+            svg.push_str("\"/>");
+        }
+        svg.push_str("</g>");
+    }
     if std::env::var("IM2VEC_FLAT_DEBUG").is_ok() {
         eprintln!("dedup_parallel: suppressed {n_dedup} doubled seam chains");
     }
@@ -2079,14 +2090,40 @@ fn classify_chain(
 ) -> ChainKind {
     let len = arc_len(c);
     let straight = straightness(c);
-    let (_, bright_frac) = chain_brightness(c, rgb, w, h);
+    let (mean_lum, bright_frac) = chain_brightness(c, rgb, w, h);
     let edge_frac = chain_edge_frac(c, edge_band, w, h);
-    // Seam: long + straight structural lines only (#20 retuning).
-    // Phase 6 templates now provide lapels/pockets/collar; the chain
-    // classifier is retuned for recall of LONG structure only. The
-    // medium-seam exception (45px) is removed — those fragments are
-    // now covered by templates or are spurious.
-    if len > 90.0 && straight > 0.85 {
+    // Distilled MLP noise gate (Gemini vision labels, 265 chains).
+    // The MLP predicts P(structural) from chain features. It acts as a
+    // two-sided filter:
+    // - P < 0.3: high-confidence artifact -> drop as noise.
+    // - Heuristic fold with P <= 0.8: low-confidence minor line -> drop.
+    //   Only high-confidence folds are drawn (as light detail lines).
+    // - Heuristic noise stays noise (tiny fragments lack visual relevance
+    //   even when the MLP is weakly positive).
+    // Set IM2VEC_NO_MLP to bypass (heuristic only).
+    let mlp_structural = if std::env::var("IM2VEC_NO_MLP").is_ok() {
+        1.0
+    } else {
+        let ((x0, y0, x1, y1), (_, cy)) = chain_bbox_centroid(c);
+        let bw = (x1 - x0).max(1.0);
+        let bh = (y1 - y0).max(1.0);
+        let feats = [
+            (len + 1.0).ln(),
+            straight,
+            mean_lum / 255.0,
+            bright_frac,
+            edge_frac,
+            (bw / bh).ln(),
+            (bw * bh + 1.0).ln() / 20.0,
+            cy / 1600.0,
+            (c.len() as f32 + 1.0).ln(),
+        ];
+        mlp::p_structural(&feats)
+    };
+    if mlp_structural < 0.3 {
+        return ChainKind::Noise;
+    }
+    let heuristic = if len > 90.0 && straight > 0.85 {
         ChainKind::Seam
     } else if len < 25.0 {
         // Sample brightness: white stitching (L>130) vs blue denim (L~110-120).
@@ -2107,6 +2144,11 @@ fn classify_chain(
         ChainKind::Stitch
     } else {
         ChainKind::Fold
+    };
+    match heuristic {
+        // Only high-confidence folds become light detail lines.
+        ChainKind::Fold if mlp_structural <= 0.8 => ChainKind::Noise,
+        other => other,
     }
 }
 
