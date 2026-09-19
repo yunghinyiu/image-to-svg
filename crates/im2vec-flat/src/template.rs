@@ -387,6 +387,38 @@ pub fn front_collar_template(vg: f32) -> Template {
     }
 }
 
+/// Buttonless front: crew neckline traced from photo evidence.
+/// `nw` is the half-width as a fraction of the view width and `depth` the
+/// bow depth as a fraction of the view height — both photo-measured by the
+/// neckline detector. The band height is a proportional style choice
+/// (0.45 x depth), not an absolute constant.
+pub fn neckline_template(nw: f32, depth: f32) -> Template {
+    let band = 0.45 * depth;
+    Template {
+        name: "neckline",
+        paths: vec![
+            // Neckline seam: smooth bow through the photo-measured landmarks.
+            TPath::solid(vec![
+                TPoint::Norm(-nw, 0.0),
+                TPoint::Norm(0.0, depth),
+                TPoint::Norm(nw, 0.0),
+            ]),
+            // Collar top edge (band).
+            TPath::solid(vec![
+                TPoint::Norm(-nw * 0.94, -band),
+                TPoint::Norm(0.0, depth - band),
+                TPoint::Norm(nw * 0.94, -band),
+            ]),
+            // Dashed topstitching below the seam.
+            TPath::dashed(vec![
+                TPoint::NormPx(-nw * 0.94, 0.0, 0.0, 5.0),
+                TPoint::NormPx(0.0, depth, 0.0, 5.0),
+                TPoint::NormPx(nw * 0.94, 0.0, 0.0, 5.0),
+            ]),
+        ],
+    }
+}
+
 /// Back view: collar band (top/bottom edges + sides), dashed topstitching
 /// along the collar bottom, and the dashed center back seam.
 pub fn back_collar_template() -> Template {
@@ -608,5 +640,33 @@ mod tests {
         );
         assert!((lo - (250.0 - 0.09 * 500.0)).abs() < 0.5, "lo={lo}");
         assert!((hi - (250.0 + 0.09 * 500.0)).abs() < 0.5, "hi={hi}");
+    }
+
+    #[test]
+    fn neckline_template_bows_through_landmarks() {
+        // nw=0.15, depth=0.03: seam bows down to 0.03h at center, band above.
+        let t = neckline_template(0.15, 0.03);
+        assert_eq!(t.name, "neckline");
+        assert_eq!(t.paths.len(), 3);
+        assert!(!t.paths[0].dashed);
+        assert!(!t.paths[1].dashed);
+        assert!(t.paths[2].dashed);
+        let p = Placement {
+            ax: 300.0,
+            ay: 140.0,
+            w: 400.0,
+            h: 600.0,
+            mirror: false,
+        };
+        let out = render_template(&t, &p);
+        assert_eq!(out.len(), 3);
+        // Seam: endpoints at ay, center bowed down by depth*h.
+        let seam = &out[0].points;
+        assert!((seam[0].0 - (300.0 - 0.15 * 400.0)).abs() < 0.5);
+        assert!((seam[0].1 - 140.0).abs() < 0.5);
+        assert!((seam[1].0 - 300.0).abs() < 0.5);
+        assert!((seam[1].1 - (140.0 + 0.03 * 600.0)).abs() < 0.5);
+        // Band edge sits above the seam.
+        assert!(out[1].points[1].1 < seam[1].1);
     }
 }
