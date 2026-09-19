@@ -413,6 +413,28 @@ pub fn neckline_template(nw: f32, depth: f32) -> Template {
     }
 }
 
+/// Sample the armhole (armscye) curve from the detected shoulder tip to the
+/// underarm pit: a quadratic Bezier with the control point at
+/// `(tip.x, pit.y)`, giving a vertical tangent at the tip and a horizontal
+/// tangent at the pit — the classic armscye shape. Only the SHAPE is fixed;
+/// both endpoints are photo-measured by [`detect::detect_armhole`], so the
+/// curve follows the garment instead of a hardcoded size.
+pub fn sample_armhole_curve(tip: (f32, f32), pit: (f32, f32), n: usize) -> Vec<(f32, f32)> {
+    let (sx, sy) = tip;
+    let (px, py) = pit;
+    let (cx, cy) = (sx, py); // control point: vertical in, horizontal out
+    (0..=n)
+        .map(|i| {
+            let t = i as f32 / n as f32;
+            let u = 1.0 - t;
+            (
+                u * u * sx + 2.0 * u * t * cx + t * t * px,
+                u * u * sy + 2.0 * u * t * cy + t * t * py,
+            )
+        })
+        .collect()
+}
+
 /// Back view: collar band (top/bottom edges + sides), dashed topstitching
 /// along the collar bottom, and the dashed center back seam.
 pub fn back_collar_template() -> Template {
@@ -639,6 +661,33 @@ mod tests {
         );
         assert!((lo - (250.0 - 0.09 * 500.0)).abs() < 0.5, "lo={lo}");
         assert!((hi - (250.0 + 0.09 * 500.0)).abs() < 0.5, "hi={hi}");
+    }
+
+    #[test]
+    fn sample_armhole_curve_endpoints_and_tangents() {
+        // Tip (100,50) -> pit (140,200): vertical tangent at the tip,
+        // horizontal at the pit (classic armscye).
+        let pts = sample_armhole_curve((100.0, 50.0), (140.0, 200.0), 20);
+        assert_eq!(pts.len(), 21);
+        assert_eq!(pts[0], (100.0, 50.0));
+        assert_eq!(pts[20], (140.0, 200.0));
+        // Vertical tangent at the tip: first step moves (almost) straight down.
+        let (dx0, dy0) = (pts[1].0 - pts[0].0, pts[1].1 - pts[0].1);
+        assert!(dx0.abs() < 0.5 && dy0 > 0.0, "start tangent=({dx0},{dy0})");
+        // Horizontal tangent at the pit: last step moves (almost) straight in.
+        let (dx1, dy1) = (pts[20].0 - pts[19].0, pts[20].1 - pts[19].1);
+        assert!(dy1.abs() < 0.5 && dx1 > 0.0, "end tangent=({dx1},{dy1})");
+        // The curve bows outboard of the tip->pit chord (convex to sleeve).
+        for p in &pts {
+            assert!(
+                p.0 <= 100.0 + (p.1 - 50.0) / 150.0 * 40.0 + 1.0,
+                "bows inboard: {p:?}"
+            );
+        }
+        // Monotonic in y.
+        for w in pts.windows(2) {
+            assert!(w[1].1 >= w[0].1);
+        }
     }
 
     #[test]
