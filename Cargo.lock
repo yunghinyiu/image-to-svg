@@ -850,6 +850,7 @@ dependencies = [
  "im2vec-core",
  "image",
  "serde",
+ "serde_json",
 ]
 
 [[package]]
