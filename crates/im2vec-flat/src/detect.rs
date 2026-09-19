@@ -194,9 +194,60 @@ pub fn detect_gorge_y(
         .filter(|&(_, s)| s >= DETECT_CONFIDENCE_MIN)
 }
 
+/// Minimum net convergence (px) for a lapel pair: top separation minus bottom
+/// separation must be this positive. Blazer lapels measure +27px; jeans
+/// pocket openings -37px; parallel fly edges ~0px.
+const MIN_LAPEL_CONVERGENCE: f32 = 10.0;
+
+/// Net horizontal convergence of a left/right chain pair going downward:
+/// positive when the pair narrows (lapel-like), negative when it splays
+/// (pocket-opening-like), near zero when parallel (fly/placket-like).
+/// Returns `None` when either chain has too few points to measure.
+fn pair_convergence(left: &[(f32, f32)], right: &[(f32, f32)]) -> Option<f32> {
+    /// Mean x of points in the top / bottom quarter of a chain's y-range.
+    fn ends(chain: &[(f32, f32)]) -> Option<(f32, f32)> {
+        if chain.len() < 4 {
+            return None;
+        }
+        let (mut y0, mut y1) = (f32::INFINITY, f32::NEG_INFINITY);
+        for &(_, y) in chain {
+            y0 = y0.min(y);
+            y1 = y1.max(y);
+        }
+        let band = 0.25 * (y1 - y0);
+        if band <= 0.0 {
+            return None;
+        }
+        let (mut tx, mut bx, mut nt, mut nb) = (0.0f32, 0.0f32, 0u32, 0u32);
+        for &(x, y) in chain {
+            if y <= y0 + band {
+                tx += x;
+                nt += 1;
+            }
+            if y >= y1 - band {
+                bx += x;
+                nb += 1;
+            }
+        }
+        if nt == 0 || nb == 0 {
+            return None;
+        }
+        Some((tx / nt as f32, bx / nb as f32))
+    }
+    let (lt, lb) = ends(left)?;
+    let (rt, rb) = ends(right)?;
+    Some((rt - lt) - (rb - lb))
+}
+
 /// Lapel edge pair: long, near-vertical chains in the upper front, symmetric
 /// about the center front. Returns the pair with confidence; the caller logs
 /// it as a structural signal (placement itself is optimized by #27 search).
+///
+/// A lapel pair must CONVERGE going down (peak wide at top, narrowing to the
+/// break). This rejects lookalikes with the same symmetry signature: pocket
+/// openings splay outward going down (negative convergence) and fly/placket
+/// edges run parallel (near-zero). Measured on the blazer (pair 30/26:
+/// +27px) vs jeans pocket openings (pair 20/22: -37px).
 pub fn detect_lapel_pair(
     chains: &[Vec<(f32, f32)>],
     cx: f32,
@@ -228,6 +279,12 @@ pub fn detect_lapel_pair(
             }
             let overlap = (l.y1.min(r.y1) - l.y0.max(r.y0)).max(0.0);
             if overlap < 60.0 {
+                continue;
+            }
+            // Lapels converge going down; pocket openings splay, flies run
+            // parallel. Reject pairs that don't narrow (see pair_convergence).
+            let conv = pair_convergence(&chains[l.idx], &chains[r.idx]).unwrap_or(0.0);
+            if conv < MIN_LAPEL_CONVERGENCE {
                 continue;
             }
             let sym = 1.0 - mirror_mismatch / 50.0;
@@ -601,17 +658,117 @@ pub struct Neckline {
 }
 
 /// Neckline (collar seam) for buttonless fronts: the strongest horizontal
-/// seam candidate in the view's upper region. Rejects straight yoke-like
-/// seams via the bow gate — a real neckline always curves downward.
-pub fn detect_neckline(chains: &[Vec<(f32, f32)>], view: &ViewContext) -> Option<Neckline> {
+/// seam candidate in the view's upper region. Must be narrower than the view
+/// (a neckline spans a fraction of the chest; a seam spanning the full width
+/// is a waistband or yoke). Rejects straight yoke-like seams via the bow
+/// gate — a real neckline always curves downward.
+/// Minimum neckline width as a fraction of view width (rejects noise).
+const MIN_NECKLINE_WIDTH_FRAC: f32 = 0.12;
+/// Maximum neckline width as a fraction of the garment's LOCAL width at the
+/// seam's height: a seam spanning the body there is a waistband/yoke, not a
+/// neckline (jeans waistband measured 0.94 of local width; a crew neckline
+/// is ~0.35 of the local chest width).
+const MAX_NECKLINE_WIDTH_FRAC: f32 = 0.75;
+
+/// Garment width (mask x-extent) at height `y`, restricted to the view's
+/// x-range. Returns 0.0 when the mask row is empty.
+fn mask_width_at_y(mask: &[bool], img_w: usize, img_h: usize, y: f32, vx0: f32, vx1: f32) -> f32 {
+    if mask.len() != img_w * img_h || img_w == 0 || img_h == 0 {
+        return 0.0;
+    }
+    let row = (y.round().clamp(0.0, img_h as f32 - 1.0)) as usize;
+    let x_lo = (vx0.max(0.0) as usize).min(img_w);
+    let x_hi = (vx1.min(img_w as f32) as usize).min(img_w);
+    let (mut lx0, mut lx1) = (img_w, 0usize);
+    for x in x_lo..x_hi {
+        if mask[row * img_w + x] {
+            lx0 = lx0.min(x);
+            lx1 = lx1.max(x);
+        }
+    }
+    if lx1 > lx0 {
+        (lx1 - lx0) as f32
+    } else {
+        0.0
+    }
+}
+
+/// Minimum gap (px) between mask intervals to count as a real separation
+/// (ignores speckle noise when looking for legs).
+const MIN_LEG_GAP: usize = 15;
+
+/// Does the view's mask show separated legs (jeans/trousers)? Samples rows
+/// in the lower half of the view; a bottom garment has ≥2 disjoint mask
+/// intervals (left leg, right leg) on ≥2 of the sampled rows. Used to
+/// suppress neckline detection on bottoms — a waistband is not a neckline.
+pub fn has_separated_legs(mask: &[bool], img_w: usize, img_h: usize, view: &ViewContext) -> bool {
+    if mask.len() != img_w * img_h || img_w == 0 || img_h == 0 {
+        return false;
+    }
+    let mut rows_with_gap = 0;
+    for &fy in &[0.60, 0.75, 0.90] {
+        let y = view.y0 + fy * view.h();
+        let row = (y.round().clamp(0.0, img_h as f32 - 1.0)) as usize;
+        let x_lo = (view.x0.max(0.0) as usize).min(img_w);
+        let x_hi = (view.x1.min(img_w as f32) as usize).min(img_w);
+        // Collect mask intervals on this row, then merge ones separated by
+        // less than MIN_LEG_GAP (speckle noise, not a real leg separation).
+        let mut intervals: Vec<(usize, usize)> = Vec::new();
+        let mut start: Option<usize> = None;
+        for x in x_lo..x_hi {
+            let m = mask[row * img_w + x];
+            match (m, start) {
+                (true, None) => start = Some(x),
+                (false, Some(s)) => {
+                    intervals.push((s, x));
+                    start = None;
+                }
+                _ => {}
+            }
+        }
+        if let Some(s) = start {
+            intervals.push((s, x_hi));
+        }
+        let mut merged = 0;
+        let mut prev_end = 0usize;
+        for (i, &(s, e)) in intervals.iter().enumerate() {
+            if i == 0 || s - prev_end >= MIN_LEG_GAP {
+                merged += 1;
+            }
+            prev_end = e;
+        }
+        if merged >= 2 {
+            rows_with_gap += 1;
+        }
+    }
+    rows_with_gap >= 2
+}
+pub fn detect_neckline(
+    chains: &[Vec<(f32, f32)>],
+    view: &ViewContext,
+    mask: &[bool],
+    img_w: usize,
+    img_h: usize,
+) -> Option<Neckline> {
     let upper = ViewContext::new(view.x0, view.y0, view.x1, view.y0 + 0.30 * view.h());
     let best = detect_horizontal_seams(chains, &upper, 40.0)
         .into_iter()
         .next()?;
     let x0 = best.lo.max(view.x0);
     let x1 = best.hi.min(view.x1);
-    if x1 - x0 < 0.12 * view.w() {
+    if x1 - x0 < MIN_NECKLINE_WIDTH_FRAC * view.w() {
         return None; // too narrow to be a neckline
+    }
+    // Local body width at the seam's height (falls back to the view width
+    // when the mask row is empty).
+    let local_w = mask_width_at_y(mask, img_w, img_h, best.pos, view.x0, view.x1);
+    let w_ref = if local_w > 0.5 * view.w() {
+        local_w.min(view.w())
+    } else {
+        view.w()
+    };
+    if x1 - x0 > MAX_NECKLINE_WIDTH_FRAC * w_ref {
+        return None; // spans the body: waistband or yoke, not a neckline
     }
     // Bow depth: deepest chain point within the extent near the seam row.
     let mut depth = 0.0f32;
@@ -781,16 +938,75 @@ mod tests {
 
     #[test]
     fn lapel_pair_found_on_synthetic() {
-        // Two long vertical chains, mirrored about cx=200.
+        // Two long vertical chains, mirrored about cx=200, CONVERGING going
+        // down (lapel-like: peak wide at top, narrowing to the break).
         let chains = vec![
-            vec![(120.0, 100.0), (122.0, 250.0)],
-            vec![(278.0, 110.0), (280.0, 240.0)],
+            vec![
+                (130.0, 100.0),
+                (135.0, 137.0),
+                (140.0, 175.0),
+                (145.0, 212.0),
+                (150.0, 250.0),
+            ],
+            vec![
+                (270.0, 100.0),
+                (265.0, 137.0),
+                (260.0, 175.0),
+                (255.0, 212.0),
+                (250.0, 250.0),
+            ],
             vec![(200.0, 100.0), (200.0, 400.0)], // center: excluded by x_inner
         ];
         let p = detect_lapel_pair(&chains, 200.0, 400.0, 50.0, 500.0).expect("lapels");
         assert_eq!(p.left_idx, 0);
         assert_eq!(p.right_idx, 1);
         assert!(p.confidence >= DETECT_CONFIDENCE_MIN);
+    }
+
+    #[test]
+    fn lapel_pair_rejects_splaying_pair() {
+        // Jeans pocket openings: mirrored and symmetric, but they DIVERGE
+        // going down (measured -37px on the real jeans photo). Not lapels.
+        let chains = vec![
+            vec![
+                (150.0, 100.0),
+                (145.0, 137.0),
+                (140.0, 175.0),
+                (135.0, 212.0),
+                (130.0, 250.0),
+            ],
+            vec![
+                (250.0, 100.0),
+                (255.0, 137.0),
+                (260.0, 175.0),
+                (265.0, 212.0),
+                (270.0, 250.0),
+            ],
+        ];
+        assert!(detect_lapel_pair(&chains, 200.0, 400.0, 50.0, 500.0).is_none());
+    }
+
+    #[test]
+    fn lapel_pair_rejects_parallel_pair() {
+        // Fly/placket edges: mirrored and symmetric but parallel (zero
+        // convergence). Not lapels.
+        let chains = vec![
+            vec![
+                (140.0, 100.0),
+                (140.0, 137.0),
+                (140.0, 175.0),
+                (140.0, 212.0),
+                (140.0, 250.0),
+            ],
+            vec![
+                (260.0, 100.0),
+                (260.0, 137.0),
+                (260.0, 175.0),
+                (260.0, 212.0),
+                (260.0, 250.0),
+            ],
+        ];
+        assert!(detect_lapel_pair(&chains, 200.0, 400.0, 50.0, 500.0).is_none());
     }
 
     #[test]
@@ -1022,10 +1238,32 @@ mod tests {
         assert_eq!(back, None);
     }
 
+    /// Test mask: filled rectangle (x_lo..x_hi, y_lo..y_hi) in an img_w x img_h
+    /// grid, for neckline local-width tests.
+    fn rect_mask(
+        img_w: usize,
+        img_h: usize,
+        x_lo: usize,
+        x_hi: usize,
+        y_lo: usize,
+        y_hi: usize,
+    ) -> Vec<bool> {
+        let mut m = vec![false; img_w * img_h];
+        for y in y_lo..y_hi.min(img_h) {
+            for x in x_lo..x_hi.min(img_w) {
+                m[y * img_w + x] = true;
+            }
+        }
+        m
+    }
+
     #[test]
     fn detect_neckline_finds_crew() {
         let view = ViewContext::new(100.0, 100.0, 500.0, 700.0);
-        let nl = detect_neckline(&crew_chains(), &view).expect("neckline");
+        // Wide body at the seam height: the 145px crew neckline is ~0.36 of
+        // the local width, well under the 0.75 waistband gate.
+        let mask = rect_mask(600, 800, 100, 500, 130, 160);
+        let nl = detect_neckline(&crew_chains(), &view, &mask, 600, 800).expect("neckline");
         assert!((nl.y - 141.0).abs() < 8.0, "y={}", nl.y);
         assert!((nl.x0 - 180.0).abs() < 15.0, "x0={}", nl.x0);
         assert!((nl.x1 - 325.0).abs() < 15.0, "x1={}", nl.x1);
@@ -1042,12 +1280,90 @@ mod tests {
             (260.0, 140.0),
             (300.0, 140.0),
         ]];
-        assert!(detect_neckline(&chains, &view).is_none());
+        let mask = rect_mask(600, 800, 100, 500, 130, 160);
+        assert!(detect_neckline(&chains, &view, &mask, 600, 800).is_none());
+    }
+
+    #[test]
+    fn detect_neckline_rejects_full_width_waistband() {
+        // A bowed seam spanning the body at its height (like a jeans
+        // waistband: 380px seam on a 400px body = 0.95 of local width) is
+        // not a neckline, even though it curves.
+        let view = ViewContext::new(100.0, 100.0, 500.0, 700.0);
+        let chains = vec![vec![
+            (110.0, 140.0),
+            (200.0, 143.0),
+            (300.0, 146.0),
+            (400.0, 143.0),
+            (490.0, 140.0),
+        ]];
+        let mask = rect_mask(600, 800, 100, 500, 130, 160);
+        assert!(detect_neckline(&chains, &view, &mask, 600, 800).is_none());
     }
 
     #[test]
     fn detect_neckline_none_without_chains() {
         let view = ViewContext::new(100.0, 100.0, 500.0, 700.0);
-        assert!(detect_neckline(&[], &view).is_none());
+        let mask = rect_mask(600, 800, 100, 500, 130, 160);
+        assert!(detect_neckline(&[], &view, &mask, 600, 800).is_none());
+    }
+
+    /// Mask with two separated legs (jeans-like): two disjoint intervals on
+    /// the lower rows.
+    fn legs_mask() -> Vec<bool> {
+        let (w, h) = (200usize, 400usize);
+        let mut m = vec![false; w * h];
+        // Legs: x 20-80 and x 120-180, from y=200 to y=400.
+        for y in 200..400 {
+            for x in 20..80 {
+                m[y * w + x] = true;
+            }
+            for x in 120..180 {
+                m[y * w + x] = true;
+            }
+        }
+        // Torso: x 20-180, y 0-200 (single interval up top).
+        for y in 0..200 {
+            for x in 20..180 {
+                m[y * w + x] = true;
+            }
+        }
+        m
+    }
+
+    #[test]
+    fn has_separated_legs_finds_jeans() {
+        let view = ViewContext::new(0.0, 0.0, 200.0, 400.0);
+        assert!(has_separated_legs(&legs_mask(), 200, 400, &view));
+    }
+
+    #[test]
+    fn has_separated_legs_rejects_single_blob() {
+        // Tee-like: single interval on all rows.
+        let (w, h) = (200usize, 400usize);
+        let mut m = vec![false; w * h];
+        for y in 0..400 {
+            for x in 50..150 {
+                m[y * w + x] = true;
+            }
+        }
+        let view = ViewContext::new(0.0, 0.0, 200.0, 400.0);
+        assert!(!has_separated_legs(&m, 200, 400, &view));
+    }
+
+    #[test]
+    fn has_separated_legs_ignores_noise_gap() {
+        // Single blob with a 5px noise gap — merged, not legs.
+        let (w, h) = (200usize, 400usize);
+        let mut m = vec![false; w * h];
+        for y in 0..400 {
+            for x in 50..150 {
+                if !(98..103).contains(&x) {
+                    m[y * w + x] = true;
+                }
+            }
+        }
+        let view = ViewContext::new(0.0, 0.0, 200.0, 400.0);
+        assert!(!has_separated_legs(&m, 200, 400, &view));
     }
 }
