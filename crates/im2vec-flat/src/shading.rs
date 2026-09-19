@@ -1,0 +1,267 @@
+//! Shape-from-shading prototype: estimate surface normals from luminance.
+//!
+//! The idea: pixel brightness encodes surface orientation (Lambertian
+//! shading). By analyzing luminance gradients we recover a normal map,
+//! then curvature from the normal field reveals folds, seams, and the
+//! true 3D structure that 2D edge detection misses.
+//!
+//! This is a prototype to validate the approach before integrating
+//! into the pipeline. Jev will judge whether the detected structures
+//! are correct.
+
+use image::{GrayImage, RgbImage};
+
+/// Estimate surface normals from a luminance image.
+///
+/// Simplified shape-from-shading:
+/// - Assumes Lambertian reflectance, light from top-front
+/// - Normal x,y proportional to negative luminance gradient
+/// - Normal z = 1 (facing camera), normalized
+///
+/// Returns (nx, ny, nz) per pixel as f32.
+pub fn estimate_normals(lum: &GrayImage) -> Vec<(f32, f32, f32)> {
+    let (w, h) = lum.dimensions();
+    let w = w as usize;
+    let h = h as usize;
+    let mut normals = Vec::with_capacity(w * h);
+
+    // Sobel kernels for gradient estimation
+    for y in 0..h {
+        for x in 0..w {
+            // Clamped sampling for borders
+            let xm = x.saturating_sub(1);
+            let xp = (x + 1).min(w - 1);
+            let ym = y.saturating_sub(1);
+            let yp = (y + 1).min(h - 1);
+
+            let get = |xx: usize, yy: usize| -> f32 {
+                lum.get_pixel(xx as u32, yy as u32)[0] as f32 / 255.0
+            };
+
+            // Sobel X
+            let gx = (get(xp, ym) + 2.0 * get(xp, y) + get(xp, yp)
+                - get(xm, ym)
+                - 2.0 * get(xm, y)
+                - get(xm, yp))
+                / 8.0;
+            // Sobel Y
+            let gy = (get(xm, yp) + 2.0 * get(x, yp) + get(xp, yp)
+                - get(xm, ym)
+                - 2.0 * get(x, ym)
+                - get(xp, ym))
+                / 8.0;
+
+            // Surface slopes away from brightness gradient.
+            // Scale factor k controls sensitivity; tuned empirically.
+            let k = 2.0;
+            let nx = -gx * k;
+            let ny = -gy * k;
+            let nz = 1.0;
+            let len = (nx * nx + ny * ny + nz * nz).sqrt();
+            normals.push((nx / len, ny / len, nz / len));
+        }
+    }
+    normals
+}
+
+/// Compute curvature (fold strength) from a normal map.
+///
+/// High curvature = rapid normal change = fold, crease, or seam.
+/// Returns per-pixel curvature magnitude.
+pub fn curvature_from_normals(normals: &[(f32, f32, f32)], w: usize, h: usize) -> Vec<f32> {
+    let mut curv = vec![0.0f32; w * h];
+    for y in 1..h - 1 {
+        for x in 1..w - 1 {
+            let i = y * w + x;
+            let (nx, ny, nz) = normals[i];
+            // Normal variation in x and y directions
+            let (nx_r, ny_r, nz_r) = normals[i + 1];
+            let (nx_d, ny_d, nz_d) = normals[i + w];
+            let dx = ((nx_r - nx).powi(2) + (ny_r - ny).powi(2) + (nz_r - nz).powi(2)).sqrt();
+            let dy = ((nx_d - nx).powi(2) + (ny_d - ny).powi(2) + (nz_d - nz).powi(2)).sqrt();
+            curv[i] = dx + dy;
+        }
+    }
+    curv
+}
+
+/// Render a normal map as an RGB image for visualization.
+/// Maps (nx, ny, nz) in [-1,1] to [0,255].
+pub fn render_normal_map(normals: &[(f32, f32, f32)], w: u32, h: u32) -> RgbImage {
+    let mut img = RgbImage::new(w, h);
+    for (i, &(nx, ny, nz)) in normals.iter().enumerate() {
+        let x = (i as u32) % w;
+        let y = (i as u32) / w;
+        img.put_pixel(
+            x,
+            y,
+            image::Rgb([
+                ((nx * 0.5 + 0.5) * 255.0) as u8,
+                ((ny * 0.5 + 0.5) * 255.0) as u8,
+                (nz * 255.0) as u8,
+            ]),
+        );
+    }
+    img
+}
+
+/// Render curvature as a grayscale heatmap.
+pub fn render_curvature(curv: &[f32], w: u32, h: u32) -> GrayImage {
+    let max_c = curv.iter().cloned().fold(0.0f32, f32::max).max(1e-6);
+    let mut img = GrayImage::new(w, h);
+    for (i, &c) in curv.iter().enumerate() {
+        let x = (i as u32) % w;
+        let y = (i as u32) / w;
+        // Square root for better dynamic range
+        let v = ((c / max_c).sqrt() * 255.0) as u8;
+        img.put_pixel(x, y, image::Luma([v]));
+    }
+    img
+}
+
+/// Curvature map for snapping template keypoints to real 3D fold ridges.
+///
+/// Unlike edge-based snapping (which finds 2D color boundaries), this finds
+/// the actual 3D fold lines from shape-from-shading curvature. Template
+/// keypoints (lapel notch, peak, etc.) snap to the nearest high-curvature
+/// ridge within the search radius.
+pub struct CurvatureMap {
+    curv: Vec<f32>,
+    w: usize,
+    h: usize,
+}
+
+impl CurvatureMap {
+    pub fn new(curv: Vec<f32>, w: usize, h: usize) -> Self {
+        Self { curv, w, h }
+    }
+
+    /// Snap (x, y) to the maximum-curvature pixel within `radius`.
+    /// Returns the snapped position, or the original if no strong ridge found.
+    /// `min_strength` is the curvature threshold (0.0-1.0 normalized).
+    pub fn snap_to_ridge(&self, x: f32, y: f32, radius: f32, min_strength: f32) -> (f32, f32) {
+        let max_c = self.curv.iter().cloned().fold(0.0f32, f32::max).max(1e-6);
+        let r = radius as isize;
+        let xi = x as isize;
+        let yi = y as isize;
+
+        let mut best = (x, y);
+        let mut best_c = min_strength * max_c;
+
+        for dy in -r..=r {
+            for dx in -r..=r {
+                let xx = xi + dx;
+                let yy = yi + dy;
+                if xx < 0 || yy < 0 || xx >= self.w as isize || yy >= self.h as isize {
+                    continue;
+                }
+                // Circular window
+                if dx * dx + dy * dy > r * r {
+                    continue;
+                }
+                let c = self.curv[yy as usize * self.w + xx as usize];
+                if c > best_c {
+                    best_c = c;
+                    best = (xx as f32, yy as f32);
+                }
+            }
+        }
+        best
+    }
+
+    /// Trace a ridge polyline starting from (x, y), following high curvature.
+    /// `dir` is the initial direction (dx, dy) normalized.
+    /// `max_steps` limits the trace length, `step` is pixels per step.
+    /// `min_strength` is the curvature threshold (0.0-1.0 normalized).
+    /// Returns the traced polyline (including start point).
+    pub fn trace_ridge(
+        &self,
+        x: f32,
+        y: f32,
+        dir: (f32, f32),
+        max_steps: usize,
+        step: f32,
+        min_strength: f32,
+    ) -> Vec<(f32, f32)> {
+        let max_c = self.curv.iter().cloned().fold(0.0f32, f32::max).max(1e-6);
+        let threshold = min_strength * max_c;
+
+        let mut points = vec![(x, y)];
+        let (mut px, mut py) = (x, y);
+        let (mut dx, mut dy) = dir;
+        // Normalize direction
+        let len = (dx * dx + dy * dy).sqrt().max(1e-6);
+        dx /= len;
+        dy /= len;
+
+        for _ in 0..max_steps {
+            // Look ahead in a cone: try directions within ±45° of current
+            let mut best = None;
+            let mut best_c = threshold;
+
+            // Sample 5 directions: -45°, -22.5°, 0°, +22.5°, +45°
+            for angle in [-0.785f32, -0.393f32, 0.0f32, 0.393f32, 0.785f32] {
+                let ca = angle.cos();
+                let sa = angle.sin();
+                let ndx = dx * ca - dy * sa;
+                let ndy = dx * sa + dy * ca;
+
+                let nx = px + ndx * step;
+                let ny = py + ndy * step;
+
+                if nx < 0.0 || ny < 0.0 || nx >= self.w as f32 || ny >= self.h as f32 {
+                    continue;
+                }
+
+                // Snap to local max within small radius
+                let (sx, sy) = self.snap_to_ridge(nx, ny, step * 0.8, min_strength);
+                let c = self.curv
+                    [(sy as usize).min(self.h - 1) * self.w + (sx as usize).min(self.w - 1)];
+
+                if c > best_c {
+                    best_c = c;
+                    best = Some((sx, sy, ndx, ndy));
+                }
+            }
+
+            match best {
+                Some((nx, ny, ndx, ndy)) => {
+                    points.push((nx, ny));
+                    px = nx;
+                    py = ny;
+                    dx = ndx;
+                    dy = ndy;
+                }
+                None => break, // No strong ridge ahead, stop
+            }
+        }
+        points
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn normals_face_camera_on_flat() {
+        // Uniform luminance -> zero gradient -> normals face camera
+        let img = GrayImage::from_pixel(10, 10, image::Luma([128u8]));
+        let normals = estimate_normals(&img);
+        for &(nx, ny, nz) in &normals {
+            assert!(nx.abs() < 1e-6);
+            assert!(ny.abs() < 1e-6);
+            assert!((nz - 1.0).abs() < 1e-6);
+        }
+    }
+
+    #[test]
+    fn curvature_zero_on_flat() {
+        let img = GrayImage::from_pixel(10, 10, image::Luma([128u8]));
+        let normals = estimate_normals(&img);
+        let curv = curvature_from_normals(&normals, 10, 10);
+        for &c in &curv {
+            assert!(c < 1e-6);
+        }
+    }
+}

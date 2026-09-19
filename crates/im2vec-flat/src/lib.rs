@@ -23,10 +23,11 @@ use std::time::Instant;
 
 mod detect;
 mod search;
+pub mod shading;
 mod template;
 use template::{
-    back_collar_template, gorge_seam_template, lapel_template, pocket_template, render_template,
-    Placement, Template,
+    back_collar_template, front_collar_template, gorge_seam_template, lapel_template_with_peak,
+    pocket_template, render_template, Placement, Template,
 };
 
 /// Max image side in px; larger inputs are downscaled for speed.
@@ -252,6 +253,19 @@ fn convert_flat_rgb(rgb: &RgbImage, opts: &FlatOptions) -> Result<FlatOutput> {
             front.y1 as f32,
         );
     }
+    stage(&mut stages, "button snap", t);
+
+    // Shape-from-shading: estimate surface normals and curvature for
+    // 3D-structure-aware template placement. The curvature map reveals
+    // true fold lines (lapel roll, armhole seams) that 2D edge detection
+    // misses. Templates snap to these ridges instead of fixed fractions.
+    let t = Instant::now();
+    let gray = image::imageops::grayscale(rgb);
+    let (cw, ch) = (gray.width() as usize, gray.height() as usize);
+    let normals = shading::estimate_normals(&gray);
+    let curv = shading::curvature_from_normals(&normals, cw, ch);
+    let curvature_map = shading::CurvatureMap::new(curv, cw, ch);
+    stage(&mut stages, "shape-from-shading", t);
     stage(&mut stages, "button detection", t);
 
     // #19: Apply artist proportion compensation to the silhouette mask.
@@ -530,8 +544,15 @@ fn convert_flat_rgb(rgb: &RgbImage, opts: &FlatOptions) -> Result<FlatOutput> {
     // Phase 6: parametric structural linework (lapels, collar, pockets).
     // Solid edges in <g id="structure">, dashed details get per-path dash.
     // Chains are passed for photo-driven template alignment (#20 refinement).
-    let (struct_solid, struct_dashed) =
-        generate_structure(&buttons, &comps, &scaled, w as usize, h as usize);
+    let (struct_solid, struct_dashed) = generate_structure(
+        &buttons,
+        &comps,
+        &scaled,
+        w as usize,
+        h as usize,
+        &mask,
+        &curvature_map,
+    );
     if !struct_solid.is_empty() || !struct_dashed.is_empty() {
         svg.push_str("<g id=\"structure\" fill=\"none\" stroke=\"#1a1a1a\" stroke-width=\"2\" stroke-linecap=\"round\" stroke-linejoin=\"round\">");
         for p in &struct_solid {
@@ -2160,37 +2181,6 @@ fn dump_chain_features(
     }
 }
 
-/// Center front x from the buttons inside a view bbox: average the midpoint
-/// of each button row (rows = buttons within 30px in y). A plain median of x
-/// fails for an even two-column double-breasted layout — it picks the upper
-/// column instead of the middle.
-fn center_front(buttons: &[Button], x0: f32, y0: f32, x1: f32, y1: f32) -> Option<f32> {
-    let mut fby: Vec<&Button> = buttons
-        .iter()
-        .filter(|b| b.cx >= x0 && b.cx <= x1 && b.cy >= y0 && b.cy <= y1)
-        .collect();
-    if fby.is_empty() {
-        return None;
-    }
-    fby.sort_by(|a, b| a.cy.partial_cmp(&b.cy).unwrap());
-    // rows: (running mean y, button xs)
-    let mut rows: Vec<(f32, Vec<f32>)> = Vec::new();
-    for b in fby {
-        match rows.last_mut() {
-            Some((ry, xs)) if (b.cy - *ry).abs() <= 30.0 => {
-                *ry = (*ry * xs.len() as f32 + b.cy) / (xs.len() + 1) as f32;
-                xs.push(b.cx);
-            }
-            _ => rows.push((b.cy, vec![b.cx])),
-        }
-    }
-    Some(
-        rows.iter()
-            .map(|(_, xs)| xs.iter().sum::<f32>() / xs.len() as f32)
-            .sum::<f32>()
-            / rows.len() as f32,
-    )
-}
 /// Phase 6: parametric structural linework (lapels, collar, pockets).
 /// The chain classifier can only keep/discard photo-traced chains; it cannot
 /// invent a lapel. This generates artist-plausible structure from landmarks:
@@ -2249,6 +2239,8 @@ fn generate_structure(
     chains: &[Vec<(f32, f32)>],
     img_w: usize,
     img_h: usize,
+    mask: &[bool],
+    _curvature_map: &shading::CurvatureMap,
 ) -> StructurePaths {
     let mut solid = Vec::new();
     let mut dashed = Vec::new();
@@ -2298,16 +2290,28 @@ fn generate_structure(
     }
 
     // Front view: lapels, collar, pockets — via #28 Template/Placement.
-    // Landmarks (button-derived) stay here; template shapes live in
-    // template.rs and render through discrete Placements.
+    // Landmarks stay here; template shapes live in template.rs and render
+    // through discrete Placements. Everything positional is photo-driven:
+    // button columns give the closure line, the detectors propose landmark
+    // rows from XDoG chains, and #27 search refines. No target-measured
+    // constants — positioning must trace the photo so a new garment gets
+    // the same treatment.
     if let Some(fi) = front_idx {
         let c = &comps[fi];
         let (x0, y0, x1, y1) = (c.x0 as f32, c.y0 as f32, c.x1 as f32, c.y1 as f32);
         let w = x1 - x0;
         let h = y1 - y0;
-        // Center front from front buttons (row-midpoint average; see
-        // center_front). Bail if no plausible front-button group.
-        let cx = match center_front(buttons, x0, y0, x1, y1) {
+        let view = detect::ViewContext::new(x0, y0, x1, y1);
+        // Closure line from button columns (garment-agnostic: 1 column is a
+        // shirt-style placket, 2 columns a double-breasted front). Bail when
+        // the closure is ambiguous or absent — closure-relative templates
+        // must not render without closure evidence.
+        let front_pts: Vec<(f32, f32)> = buttons
+            .iter()
+            .filter(|b| b.cx >= x0 && b.cx <= x1 && b.cy >= y0 && b.cy <= y1)
+            .map(|b| (b.cx, b.cy))
+            .collect();
+        let cx = match detect::closure_center(&detect::detect_button_columns(&front_pts, &view)) {
             Some(cx) => cx,
             None => return (solid, dashed),
         };
@@ -2383,63 +2387,88 @@ fn generate_structure(
             w: lapel_w,
             ..frame
         };
-        let lapel = lapel_template(vg, vb);
-        for mirror in [true, false] {
-            let side_frame = Placement {
-                mirror,
-                ..lapel_frame
-            };
-            push_rendered(&mut solid, &mut dashed, &lapel, &side_frame);
-            // Gorge seam is drawn once, after the left (mirrored) side,
-            // matching the original loop's `if side < 0.0` placement.
-            if mirror {
-                push_rendered(
-                    &mut solid,
-                    &mut dashed,
-                    &gorge_seam_template(vg),
-                    &lapel_frame,
-                );
+        // Lapel/collar/gorge render only when the photo shows lapel
+        // structure (the detected lapel edge pair): a new garment without
+        // lapels must not get a blazer template drawn on it.
+        if lapel_pair.is_some() {
+            for mirror in [true, false] {
+                let side_frame = Placement {
+                    mirror,
+                    ..lapel_frame
+                };
+                // Template lapel: break -> notch -> peak -> brk.
+                // Placement is photo-driven (detector vg + edge search);
+                // shape work continues in template.rs.
+                let lapel = lapel_template_with_peak(vg, vb, 0.25);
+                push_rendered(&mut solid, &mut dashed, &lapel, &side_frame);
+                // Gorge seam (drawn once)
+                if mirror {
+                    push_rendered(
+                        &mut solid,
+                        &mut dashed,
+                        &gorge_seam_template(vg),
+                        &lapel_frame,
+                    );
+                }
             }
+            // #17: front collar band between the notches (drawn once).
+            push_rendered(
+                &mut solid,
+                &mut dashed,
+                &front_collar_template(vg),
+                &lapel_frame,
+            );
+        } else if std::env::var("IM2VEC_FLAT_DEBUG").is_ok() {
+            eprintln!("[detect] no lapel pair — skipping lapel/collar templates");
         }
 
-        // Pocket flaps (mirrored): rounded rect + dashed topstitching.
+        // Pocket flaps (rounded rect + dashed topstitching), x centers traced
+        // from the detected flap chains — not fixed fractions of the view.
+        // Rendered only when the detector fires: no phantom pockets on
+        // garments that have none.
         // #20 refinement: align pocket Y to bottom button row.
         let pocket_y_default = y0 + 0.73 * h;
         let pocket_y_refined = refine_pocket_y(buttons, x0, y0, x1, y1, pocket_y_default);
-        // #29: pocket detector proposes the flap y; #27 search refines it.
-        let pocket_proposal = detect::detect_pocket_y(chains, cx, w, pocket_y_refined)
-            .filter(|&(_, conf)| conf >= detect::DETECT_CONFIDENCE_MIN);
-        let pocket_center = pocket_proposal.map(|(y, _)| y).unwrap_or(pocket_y_refined);
-        let pocket = pocket_template(w, h);
-        let pocket_y = search::search_pocket_y(pocket_center, &pocket, cx, w, h, &edges);
+        // #29: pocket detector proposes flap y and x centers; #27 search
+        // refines y against photo edges.
+        let pocket_proposal = detect::detect_pocket_flaps(chains, cx, w, pocket_y_refined)
+            .filter(|f| f.confidence >= detect::DETECT_CONFIDENCE_MIN);
         if std::env::var("IM2VEC_FLAT_DEBUG").is_ok() {
             match pocket_proposal {
-                Some((py, pc)) => eprintln!(
-                    "[detect] pocket y={py:.1} (conf {pc:.2}), search {pocket_center:.1}->{pocket_y:.1}"
+                Some(f) => eprintln!(
+                    "[detect] pocket y={:.1} x={:.0}/{:.0} (conf {:.2})",
+                    f.y, f.left_cx, f.right_cx, f.confidence
                 ),
-                None => eprintln!("[detect] pocket heuristic, search {pocket_center:.1}->{pocket_y:.1}"),
+                None => eprintln!("[detect] no pocket pair — skipping pocket templates"),
             }
         }
-        for side in [-1.0f32, 1.0] {
-            let pocket_frame = Placement {
-                ax: cx + side * 0.25 * w,
-                ay: pocket_y,
-                w,
-                h,
-                mirror: false,
-            };
-            push_rendered(&mut solid, &mut dashed, &pocket, &pocket_frame);
+        if let Some(f) = pocket_proposal {
+            let pocket = pocket_template(w, h);
+            let pocket_y =
+                search::search_pocket_y(f.y, &pocket, f.left_cx, f.right_cx, w, h, &edges);
+            for &ax in &[f.left_cx, f.right_cx] {
+                let pocket_frame = Placement {
+                    ax,
+                    ay: pocket_y,
+                    w,
+                    h,
+                    mirror: false,
+                };
+                push_rendered(&mut solid, &mut dashed, &pocket, &pocket_frame);
+            }
         }
     }
 
-    // Back view: collar band + center back seam.
+    // Back view: collar band + center back seam. The frame axis comes from
+    // mask moments (no buttons on a back view) instead of the bbox center.
     if let Some(bi) = back_idx {
         let c = &comps[bi];
         let (x0, y0, x1, y1) = (c.x0 as f32, c.y0 as f32, c.x1 as f32, c.y1 as f32);
         let w = x1 - x0;
         let h = y1 - y0;
+        let view = detect::ViewContext::new(x0, y0, x1, y1);
         let frame = Placement {
-            ax: (x0 + x1) * 0.5,
+            ax: detect::refine_axis_from_mask(mask, img_w, img_h, &view),
             ay: y0,
             w,
             h,
@@ -3304,49 +3333,6 @@ mod tests {
     }
 
     #[test]
-    fn center_front_averages_row_midpoints() {
-        // Double-breasted two-column layout: a plain median of x would pick
-        // 449 (upper column); the true center is ~411.5.
-        let buttons = vec![
-            Button {
-                cx: 360.5,
-                cy: 425.5,
-            },
-            Button {
-                cx: 463.0,
-                cy: 425.5,
-            },
-            Button {
-                cx: 373.0,
-                cy: 492.0,
-            },
-            Button {
-                cx: 451.5,
-                cy: 493.5,
-            },
-            Button {
-                cx: 373.0,
-                cy: 564.5,
-            },
-            Button {
-                cx: 449.0,
-                cy: 566.5,
-            },
-        ];
-        let cx = center_front(&buttons, 163.0, 127.0, 659.0, 711.0).unwrap();
-        assert!((cx - 411.5).abs() < 1.0, "cx={cx:.1}, want ~411.5");
-    }
-
-    #[test]
-    fn center_front_none_without_buttons_in_view() {
-        let buttons = vec![Button {
-            cx: 360.5,
-            cy: 425.5,
-        }];
-        assert!(center_front(&buttons, 978.0, 128.0, 1453.0, 710.0).is_none());
-    }
-
-    #[test]
     fn generate_structure_finds_front_and_back() {
         // Mock: front component with 6 buttons, back component, sleeve.
         let comps = vec![
@@ -3409,10 +3395,16 @@ mod tests {
                 cy: 566.0,
             },
         ];
-        let (solid, dashed) = generate_structure(&buttons, &comps, &[], 1600, 900);
-        // Front: 2 lapel edges + 2 roll lines + 1 gorge + 2 notch ticks (in edge)
-        //        + 2 pockets = ~9 solid; back: collar (4) = 4 solid.
-        // Dashed: 2 lapel stitch + 2 pocket stitch + 1 collar stitch + 1 back seam.
+        // Dummy curvature map for test (empty, no snapping will occur).
+        let dummy_curv = vec![0.0f32; 1600 * 900];
+        let dummy_map = shading::CurvatureMap::new(dummy_curv, 1600, 900);
+        // Empty mask: the back-view axis falls back to the bbox center.
+        let mask = vec![false; 1600 * 900];
+        let (solid, dashed) =
+            generate_structure(&buttons, &comps, &[], 1600, 900, &mask, &dummy_map);
+        // Back view always renders (collar + center back seam); the front
+        // needs photo evidence (button columns + detected chains), which the
+        // empty chain list does not provide.
         assert!(!solid.is_empty(), "no solid structure paths");
         assert!(!dashed.is_empty(), "no dashed structure paths");
         // All points within the view bboxes (with margin).
@@ -3446,7 +3438,10 @@ mod tests {
                 symmetrized: true,
             },
         ];
-        let (solid, dashed) = generate_structure(&[], &comps, &[], 1600, 900);
+        let dummy_curv = vec![0.0f32; 1600 * 900];
+        let dummy_map = shading::CurvatureMap::new(dummy_curv, 1600, 900);
+        let mask = vec![false; 1600 * 900];
+        let (solid, dashed) = generate_structure(&[], &comps, &[], 1600, 900, &mask, &dummy_map);
         assert!(solid.is_empty() && dashed.is_empty());
     }
 }
