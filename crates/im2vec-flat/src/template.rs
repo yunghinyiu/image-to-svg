@@ -156,6 +156,9 @@ pub fn render_template(t: &Template, p: &Placement) -> Vec<RenderedPath> {
 }
 
 /// Sample a cubic Bezier in (u, v) template space into `n` segments.
+/// (Currently unused outside its test after the straight-edge lapel rework;
+/// kept for future curved template edges.)
+#[allow(dead_code)]
 fn sample_cubic_uv(
     p0: (f32, f32),
     p1: (f32, f32),
@@ -243,11 +246,9 @@ pub fn lapel_template_with_peak(vg: f32, _vb: f32, peak_x: f32) -> Template {
                                   // Notch: HORIZONTAL step outward (same Y as break for sharp 90° corner).
     let notch_outer = (0.16f32, vg); // Step outward, NO vertical drop
                                      // Peak: widest point, just below notch (shallow top edge).
-    let peak = (peak_x, vg + 0.06f32); // Peak close to notch (shallow angle)
-                                       // brk: where lapel meets front edge. NOT at button (vb) — above it.
-                                       // Target lapel height ~0.35 (vg=0.08 to brk=0.43).
-    let brk = (0.10f32, vg + 0.35f32); // Meets front edge above button
-                                       // (Old cubic curve rendered a rounded shield; removed per target.)
+    let peak = (peak_x, vg + 0.073f32); // Peak: target (0.250,0.244), vg=0.171
+    let brk = (0.10f32, vg + 0.244f32); // Bottom: measured (0.107,0.415)
+                                        // (Old cubic curve rendered a rounded shield; removed per target.)
     Template {
         name: "lapel",
         paths: vec![
@@ -257,17 +258,17 @@ pub fn lapel_template_with_peak(vg: f32, _vb: f32, peak_x: f32) -> Template {
                 TPoint::Norm(break_pt.0, break_pt.1),
                 TPoint::Norm(notch_outer.0, notch_outer.1),
             ]),
-            // Lapel top edge: STRAIGHT from break to peak (sharp angle at break).
+            // Lapel top edge: STRAIGHT (target has crisp tailored edges, not curves).
             TPath::solid(vec![
                 TPoint::Norm(notch_outer.0, notch_outer.1),
                 TPoint::Norm(peak.0, peak.1),
             ]),
-            // Lapel outer edge: peak -> break (straight, angular).
+            // Lapel outer edge: STRAIGHT (crisp, per target).
             TPath::solid(vec![
                 TPoint::Norm(peak.0, peak.1),
                 TPoint::Norm(brk.0, brk.1),
             ]),
-            // Dashed topstitching parallel to lapel edges, inset 9px.
+            // Dashed topstitching parallel to straight lapel edges, inset 9px.
             TPath::dashed(vec![
                 TPoint::NormPx(notch_outer.0, notch_outer.1, -9.0, 2.0),
                 TPoint::NormPx(peak.0, peak.1, -9.0, 0.0),
