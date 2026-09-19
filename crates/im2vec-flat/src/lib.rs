@@ -2417,7 +2417,7 @@ fn generate_structure(
                 // Template lapel: break -> notch -> peak -> brk.
                 // Placement is photo-driven (detector vg + edge search);
                 // shape work continues in template.rs.
-                let lapel = lapel_template_with_peak(vg, vb, 0.25);
+                let lapel = lapel_template_with_peak(vg, vb, 0.20);
                 push_rendered(&mut solid, &mut dashed, &lapel, &side_frame);
                 // Gorge seam (drawn once)
                 if mirror {

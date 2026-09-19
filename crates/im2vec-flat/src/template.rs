@@ -235,20 +235,47 @@ pub fn lapel_template_with_peak(vg: f32, _vb: f32, peak_x: f32) -> Template {
     // - Peak: outermost point, juts OUTWARD from the notch
     // - Break: where lapel meets the front edge at button level
     //
-    // The target shows a distinct notch step, not a smooth V. The peak
-    // points outward (horizontally), not downward.
-    // Notched lapel with SHARP BREAK at collar-lapel junction (Jev conf 1.0).
-    // The break is a distinct angular corner where the collar ends and the
-    // lapel begins. The lapel's top edge is STRAIGHT from break to peak.
-    // Target shows a pronounced step, not a subtle one.
-    // PEAK MUST BE FURTHER OUT than notch_outer to create the jut.
+    // The target shows ELEGANT CURVES, not straight lines. The lapel's outer
+    // edge flows from the notch in a smooth convex curve to the peak, then
+    // sweeps down and inward in a long gentle S-curve to the break point.
+    // The roll line (inner edge) has a subtle convex bow.
+    // (#33: straight edges looked angular/geometric; the old cubic was a
+    // rounded shield. These are tailored curves matched to the target.)
     let break_pt = (0.08f32, vg); // BREAK: collar ends here
                                   // Notch: HORIZONTAL step outward (same Y as break for sharp 90° corner).
     let notch_outer = (0.16f32, vg); // Step outward, NO vertical drop
-                                     // Peak: widest point, just below notch (shallow top edge).
-    let peak = (peak_x, vg + 0.073f32); // Peak: target (0.250,0.244), vg=0.171
-    let brk = (0.10f32, vg + 0.244f32); // Bottom: measured (0.107,0.415)
-                                        // (Old cubic curve rendered a rounded shield; removed per target.)
+    let brk = (0.10f32, vg + 0.280f32); // Bottom: where lapel meets front edge
+
+    // Outer edge: SINGLE smooth curve from notch to break.
+    // Bows outward to a gentle maximum (the "peak") in the upper third,
+    // then flows down and inward. No sharp corner — the peak is a smooth
+    // maximum, not a point. (#33: the target's lapel is a continuous
+    // elegant curve, not two segments meeting at a jut.)
+    // peak_x controls the max width (the outward bow).
+    let outer_edge = sample_cubic_uv(
+        notch_outer,
+        (peak_x + 0.04, vg + 0.050), // push outward to peak_x
+        (peak_x - 0.04, vg + 0.180), // come back in
+        brk,
+        20,
+    );
+    // Roll line: break_pt -> brk, subtle convex bow toward center.
+    let roll_line = sample_cubic_uv(break_pt, (0.075, vg + 0.090), (0.082, vg + 0.190), brk, 12);
+    // Dashed topstitching: offset the curved outer edge inward by 9px.
+    let outer_stitch: Vec<TPoint> = sample_cubic_uv(
+        notch_outer,
+        (peak_x + 0.04, vg + 0.050),
+        (peak_x - 0.04, vg + 0.180),
+        brk,
+        20,
+    )
+    .into_iter()
+    .map(|p| match p {
+        TPoint::Norm(u, v) => TPoint::NormPx(u, v, -9.0, 0.0),
+        other => other,
+    })
+    .collect();
+
     Template {
         name: "lapel",
         paths: vec![
@@ -258,30 +285,13 @@ pub fn lapel_template_with_peak(vg: f32, _vb: f32, peak_x: f32) -> Template {
                 TPoint::Norm(break_pt.0, break_pt.1),
                 TPoint::Norm(notch_outer.0, notch_outer.1),
             ]),
-            // Lapel top edge: STRAIGHT (target has crisp tailored edges, not curves).
-            TPath::solid(vec![
-                TPoint::Norm(notch_outer.0, notch_outer.1),
-                TPoint::Norm(peak.0, peak.1),
-            ]),
-            // Lapel outer edge: STRAIGHT (crisp, per target).
-            TPath::solid(vec![
-                TPoint::Norm(peak.0, peak.1),
-                TPoint::Norm(brk.0, brk.1),
-            ]),
-            // Dashed topstitching parallel to straight lapel edges, inset 9px.
-            TPath::dashed(vec![
-                TPoint::NormPx(notch_outer.0, notch_outer.1, -9.0, 2.0),
-                TPoint::NormPx(peak.0, peak.1, -9.0, 0.0),
-            ]),
-            TPath::dashed(vec![
-                TPoint::NormPx(peak.0, peak.1, -9.0, 0.0),
-                TPoint::NormPx(brk.0, brk.1, -9.0, 0.0),
-            ]),
-            // Roll line: break -> brk (the V opening, straight).
-            TPath::solid(vec![
-                TPoint::Norm(break_pt.0, break_pt.1),
-                TPoint::Norm(brk.0, brk.1),
-            ]),
+            // Lapel outer edge: SINGLE smooth curve (notch -> break).
+            // Gentle outward maximum, no sharp peak.
+            TPath::solid(outer_edge),
+            // Dashed topstitching parallel to the curved outer edge, inset 9px.
+            TPath::dashed(outer_stitch),
+            // Roll line: break -> brk (the V opening, subtly curved).
+            TPath::solid(roll_line),
         ],
     }
 }
@@ -572,15 +582,17 @@ mod tests {
 
     #[test]
     fn lapel_template_has_expected_path_count() {
-        // Notched lapel with break: 1 break step + 2 solid lapel edges
-        // + 2 dashed stitching + 1 solid roll = 6 paths.
+        // Notched lapel with break: 1 break step + 1 solid curved outer edge
+        // + 1 dashed stitching + 1 solid roll = 4 paths.
+        // (#33: single smooth curve replaces the two-segment peaked design.)
         let t = lapel_template(0.09, 0.4);
-        assert_eq!(t.paths.len(), 6);
-        assert_eq!(t.paths.iter().filter(|p| p.dashed).count(), 2);
-        // All straight lines have 2 points each.
-        for p in &t.paths {
-            assert_eq!(p.points.len(), 2);
-        }
+        assert_eq!(t.paths.len(), 4);
+        assert_eq!(t.paths.iter().filter(|p| p.dashed).count(), 1);
+        // The break step is a straight 2-point line; the curves are sampled.
+        assert_eq!(t.paths[0].points.len(), 2);
+        assert!(t.paths[1].points.len() > 2); // outer edge (bezier sampled)
+        assert!(t.paths[2].points.len() > 2); // stitching (bezier sampled)
+        assert!(t.paths[3].points.len() > 2); // roll line (bezier sampled)
     }
 
     #[test]
