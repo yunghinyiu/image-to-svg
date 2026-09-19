@@ -1,7 +1,7 @@
 # im2vec — image to vector SVG (Rust)
 
 Logo-first raster → vector tracer. Any PNG/JPG/WebP in, high-quality SVG out.
-Built on [`vtracer`](https://github.com/visioncortex/VTracer) (MIT, pure Rust) — we wrap it with logo-tuned presets, a CLI, and a dev-server preview UI. We fork only if we outgrow it.
+Built on [`vtracer`](https://github.com/visioncortex/VTracer) (MIT, pure Rust) we wrap it with logo-tuned presets, a CLI, and a dev-server preview UI. We fork only if we outgrow it.
 
 ## Layout
 
@@ -19,14 +19,3 @@ cargo run -p im2vec-cli -- samples/logo.png -o /tmp/out.svg --preset logo
 PORT=5173 cargo run -p im2vec-web
 # open http://127.0.0.1:5173
 ```
-
-## Roadmap slices
-
-1. ✅ Slice 0: workspace + core + CLI + web shell
-2. ✅ Slice 1: logo pipeline tuning (speckle, simplify, palette snapping)
-3. ✅ Slice 2/3: illustration + photo mode (watershed segmentation preserves gradients/shadows)
-4. ✅ Web UX: paste / drag-drop auto-convert, opt-in SVG download
-5. ✅ Slice 6 (Phase 1): flat-lay → flat sketch draft (silhouette + seams, symmetrized)
-6. Slice 7 (Phase 2): on-model photos via segformer-b2-clothes ONNX segmenter
-7. Slice 4: quality harness (render-back diff MSE/SSIM, A/B comparator)
-8. Slice 5: perf (rayon, Session caching for slider interactivity) + export PDF/EPS
