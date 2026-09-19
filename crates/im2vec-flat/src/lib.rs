@@ -58,7 +58,9 @@ pub struct FlatOptions {
     /// Mirror the detail linework too. Off by default: asymmetric details
     /// (chest logos, pockets) must stay where they are, not be duplicated.
     pub symmetrize_lines: bool,
-    /// Outline stroke width in px on the silhouette path.
+    /// Explicit silhouette outline width in px. 0 (default) auto-derives the
+    /// whole line-weight hierarchy from garment size (#44); the remaining
+    /// groups always scale from the outline via fixed ratios.
     pub outline_width: f32,
     /// 0..=1. Higher keeps weaker lines (fabric folds); lower keeps only
     /// strong edges (seams, hems, trims).
@@ -80,7 +82,7 @@ impl Default for FlatOptions {
             input: FlatInput::FlatLay,
             symmetrize: true,
             symmetrize_lines: false,
-            outline_width: 2.0,
+            outline_width: 0.0,
             detail_strength: 0.6,
             speckle: 4,
             proportion_compensation: (1.18, 1.27),
@@ -200,6 +202,39 @@ fn compensate_point(x: f32, y: f32, w: f32, h: f32, sx: f32, sy: f32) -> (f32, f
     ((x - cx) * sx + cx, (y - cy) * sy + cy)
 }
 
+/// #44: height of the garment mask's bounding box in px — the size measure
+/// all stroke widths derive from, so the line hierarchy scales with output.
+fn mask_bbox_h(mask: &[bool], w: usize, _h: usize) -> f32 {
+    let mut y0 = usize::MAX;
+    let mut y1 = 0usize;
+    for (i, &m) in mask.iter().enumerate() {
+        if m {
+            let y = i / w;
+            y0 = y0.min(y);
+            y1 = y1.max(y);
+        }
+    }
+    if y1 >= y0 {
+        (y1 - y0 + 1) as f32
+    } else {
+        1.0
+    }
+}
+
+/// #44: stroke widths for (outline, seams, details, stitching).
+/// Outline ~= 0.5% of the silhouette bbox height; the rest are fixed ratios
+/// of it, so the hierarchy (outline > seams > details > stitching) reads at
+/// any canvas size. `outline_override` > 0 pins the outline to an explicit
+/// px width (the old `outline_width` behavior); the ratios still apply.
+fn line_weights(sil_bbox_h: f32, outline_override: f32) -> (f32, f32, f32, f32) {
+    let outline = if outline_override > 0.0 {
+        outline_override
+    } else {
+        (0.005 * sil_bbox_h).max(1.0)
+    };
+    (outline, 0.6 * outline, 0.35 * outline, 0.3 * outline)
+}
+
 /// Full-resolution garment mask (white = garment) for the eval harness.
 /// Runs the same backdrop-keying + symmetrization as [`convert_flat_bytes`];
 /// additive measurement API, does not change pipeline output.
@@ -280,6 +315,13 @@ fn convert_flat_rgb(rgb: &RgbImage, opts: &FlatOptions) -> Result<FlatOutput> {
         mask_unscaled
     };
 
+    // #44: line-weight hierarchy derived from the silhouette bbox height so
+    // outline > seams > details > stitching reads at any output scale.
+    let (w_outline, w_seam, w_detail, w_stitch) = line_weights(
+        mask_bbox_h(&mask, w as usize, h as usize),
+        opts.outline_width,
+    );
+
     // 2. silhouette pass: black garment on white.
     let t = Instant::now();
     let sil_img = mask_to_color(&mask, w, h);
@@ -289,7 +331,7 @@ fn convert_flat_rgb(rgb: &RgbImage, opts: &FlatOptions) -> Result<FlatOutput> {
     if sil_paths.is_empty() {
         bail!("silhouette trace produced no paths");
     }
-    let ow = opts.outline_width.max(0.5);
+    let ow = w_outline;
     let styled_sil: Vec<String> = sil_paths
         .iter()
         .map(|p| {
@@ -496,7 +538,7 @@ fn convert_flat_rgb(rgb: &RgbImage, opts: &FlatOptions) -> Result<FlatOutput> {
     // the compensated output frame (same transform as silhouette/buttons).
     let (dsx, dsy) = opts.proportion_compensation;
     let dpt = |x: f32, y: f32| compensate_point(x, y, w as f32, h as f32, dsx, dsy);
-    svg.push_str("<g id=\"seams\" fill=\"none\" stroke=\"#1a1a1a\" stroke-width=\"2\" stroke-linecap=\"round\" stroke-linejoin=\"round\">");
+    svg.push_str(&format!("<g id=\"seams\" fill=\"none\" stroke=\"#1a1a1a\" stroke-width=\"{w_seam:.1}\" stroke-linecap=\"round\" stroke-linejoin=\"round\">"));
     let mut n_det = 0;
     // Phase 5: suppress doubled seam lines before emitting.
     let seam_keep = dedup_parallel(&seams);
@@ -522,7 +564,7 @@ fn convert_flat_rgb(rgb: &RgbImage, opts: &FlatOptions) -> Result<FlatOutput> {
     // Minor structure renders as light detail lines (separate group so they
     // don't inherit the seam group's full-weight stroke).
     if !folds.is_empty() {
-        svg.push_str("<g id=\"details\" fill=\"none\" stroke=\"#6b6b6b\" stroke-width=\"1\" stroke-linecap=\"round\" stroke-linejoin=\"round\">");
+        svg.push_str(&format!("<g id=\"details\" fill=\"none\" stroke=\"#6b6b6b\" stroke-width=\"{w_detail:.1}\" stroke-linecap=\"round\" stroke-linejoin=\"round\">"));
         for c in folds.iter() {
             n_det += 1;
             let (mx, my) = dpt(c[0].0, c[0].1);
@@ -540,7 +582,7 @@ fn convert_flat_rgb(rgb: &RgbImage, opts: &FlatOptions) -> Result<FlatOutput> {
     }
     // Procedural topstitching (dashed) — generated hems/cuffs + smoothed photo stitching.
     let stitch_paths = generate_stitching(&mask, &comps, w as usize, h as usize);
-    svg.push_str("<g id=\"stitching\" fill=\"none\" stroke=\"#1a1a1a\" stroke-width=\"1.5\" stroke-linecap=\"round\" stroke-linejoin=\"round\" stroke-dasharray=\"7 4\">");
+    svg.push_str(&format!("<g id=\"stitching\" fill=\"none\" stroke=\"#1a1a1a\" stroke-width=\"{w_stitch:.1}\" stroke-linecap=\"round\" stroke-linejoin=\"round\" stroke-dasharray=\"7 4\">"));
     for p in stitch_paths.iter().chain(stitches.iter()) {
         n_det += 1;
         let (mx, my) = dpt(p[0].0, p[0].1);
@@ -565,7 +607,7 @@ fn convert_flat_rgb(rgb: &RgbImage, opts: &FlatOptions) -> Result<FlatOutput> {
         &curvature_map,
     );
     if !struct_solid.is_empty() || !struct_dashed.is_empty() {
-        svg.push_str("<g id=\"structure\" fill=\"none\" stroke=\"#1a1a1a\" stroke-width=\"2\" stroke-linecap=\"round\" stroke-linejoin=\"round\">");
+        svg.push_str(&format!("<g id=\"structure\" fill=\"none\" stroke=\"#1a1a1a\" stroke-width=\"{w_seam:.1}\" stroke-linecap=\"round\" stroke-linejoin=\"round\">"));
         for p in &struct_solid {
             let (mx, my) = dpt(p[0].0, p[0].1);
             svg.push_str(&format!("<path d=\"M{mx:.1},{my:.1}"));
@@ -603,7 +645,7 @@ fn convert_flat_rgb(rgb: &RgbImage, opts: &FlatOptions) -> Result<FlatOutput> {
         let ko = br + 3.0;
         svg.push_str(&format!(
             "<defs><g id=\"btn\"><circle r=\"{ko:.1}\" fill=\"#ffffff\"/>\
-             <circle r=\"{br:.1}\" fill=\"none\" stroke=\"#1a1a1a\" stroke-width=\"2\"/>\
+             <circle r=\"{br:.1}\" fill=\"none\" stroke=\"#1a1a1a\" stroke-width=\"{w_seam:.1}\"/>\
              <circle cx=\"{:.1}\" cy=\"{:.1}\" r=\"{hr:.1}\" fill=\"#1a1a1a\"/>\
              <circle cx=\"{:.1}\" cy=\"{:.1}\" r=\"{hr:.1}\" fill=\"#1a1a1a\"/>\
              <circle cx=\"{:.1}\" cy=\"{:.1}\" r=\"{hr:.1}\" fill=\"#1a1a1a\"/>\
@@ -3247,6 +3289,49 @@ mod tests {
         m[55] = true;
         let s = aniso_scale_mask(&m, 10, 10, 1.0, 1.0);
         assert_eq!(s, m);
+    }
+
+    #[test]
+    fn line_weights_auto_hierarchy() {
+        // #44: 0.5% of a 1000px silhouette -> 5.0 outline, fixed ratios below.
+        let (o, s, d, st) = line_weights(1000.0, 0.0);
+        assert!((o - 5.0).abs() < 1e-6);
+        assert!((s - 3.0).abs() < 1e-6);
+        assert!((d - 1.75).abs() < 1e-6);
+        assert!((st - 1.5).abs() < 1e-6);
+        assert!(o > s && s > d && d > st, "strict hierarchy");
+    }
+
+    #[test]
+    fn line_weights_scales_with_size() {
+        // Doubling the garment doubles every width.
+        let a = line_weights(500.0, 0.0);
+        let b = line_weights(1000.0, 0.0);
+        assert!((b.0 - 2.0 * a.0).abs() < 1e-6);
+        assert!((b.1 - 2.0 * a.1).abs() < 1e-6);
+    }
+
+    #[test]
+    fn line_weights_explicit_override_keeps_ratios() {
+        // Positive outline_width pins the outline; hierarchy still derives.
+        let (o, s, d, st) = line_weights(1000.0, 2.5);
+        assert!((o - 2.5).abs() < 1e-6);
+        assert!((s - 1.5).abs() < 1e-6);
+        assert!((d - 0.875).abs() < 1e-6);
+        assert!((st - 0.75).abs() < 1e-6);
+    }
+
+    #[test]
+    fn mask_bbox_h_measures_rows() {
+        // 10x10 mask, rows 2..=5 set -> height 4.
+        let mut m = vec![false; 100];
+        for y in 2..=5 {
+            m[y * 10 + 3] = true;
+        }
+        assert!((mask_bbox_h(&m, 10, 10) - 4.0).abs() < 1e-6);
+        // Empty mask -> degenerate 1.0, never 0 or NaN.
+        let empty = vec![false; 100];
+        assert!((mask_bbox_h(&empty, 10, 10) - 1.0).abs() < 1e-6);
     }
 
     #[test]
