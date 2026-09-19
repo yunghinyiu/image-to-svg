@@ -581,14 +581,30 @@ fn convert_flat_rgb(rgb: &RgbImage, opts: &FlatOptions) -> Result<FlatOutput> {
         eprintln!("dedup_parallel: suppressed {n_dedup} doubled seam chains");
     }
     // Procedural topstitching (dashed) — generated hems/cuffs + smoothed photo stitching.
-    let stitch_paths = generate_stitching(&mask, &comps, w as usize, h as usize);
+    let stitch_paths = generate_stitching(&mask, &comps, w as usize, h as usize, dsx, dsy);
     svg.push_str(&format!("<g id=\"stitching\" fill=\"none\" stroke=\"#1a1a1a\" stroke-width=\"{w_stitch:.1}\" stroke-linecap=\"round\" stroke-linejoin=\"round\" stroke-dasharray=\"7 4\">"));
-    for p in stitch_paths.iter().chain(stitches.iter()) {
+    // #43: stitch_paths are already in output coords (traced on the
+    // compensated mask) — emitting them through dpt double-applied the
+    // compensation and pushed them below the viewBox. Photo-frame stitch
+    // chains still need dpt. Both are clamped to the viewBox as a backstop.
+    for p in &stitch_paths {
         n_det += 1;
-        let (mx, my) = dpt(p[0].0, p[0].1);
+        let (mx, my) = clamp_viewbox(p[0].0, p[0].1, w as f32, h as f32);
         svg.push_str(&format!("<path d=\"M{mx:.1},{my:.1}"));
         for &(px, py) in &p[1..] {
-            let (lx, ly) = dpt(px, py);
+            let (lx, ly) = clamp_viewbox(px, py, w as f32, h as f32);
+            svg.push_str(&format!("L{lx:.1},{ly:.1}"));
+        }
+        svg.push_str("\"/>");
+    }
+    for c in stitches.iter() {
+        n_det += 1;
+        let (qx, qy) = dpt(c[0].0, c[0].1);
+        let (mx, my) = clamp_viewbox(qx, qy, w as f32, h as f32);
+        svg.push_str(&format!("<path d=\"M{mx:.1},{my:.1}"));
+        for &(px, py) in &c[1..] {
+            let (qx, qy) = dpt(px, py);
+            let (lx, ly) = clamp_viewbox(qx, qy, w as f32, h as f32);
             svg.push_str(&format!("L{lx:.1},{ly:.1}"));
         }
         svg.push_str("\"/>");
@@ -2718,13 +2734,22 @@ fn generate_structure(
 
 /// Generate procedural topstitching (dashed) as inward offsets of the
 /// silhouette's bottom edges (hems + cuffs). For each view component,
-/// trace the bottom boundary, take the longest contiguous run, offset
-/// upward by INSET, and simplify. Returns polylines in output coords.
+/// trace the bottom boundary, keep every run longer than a size-derived
+/// minimum, offset upward by INSET, and simplify.
+///
+/// #43: `mask` is the compensated (output-frame) mask, so the returned
+/// polylines are already in output coords and must be emitted WITHOUT
+/// the photo->output `dpt` mapping — applying it double-compensated and
+/// pushed the paths below the viewBox. `comps` bboxes are photo-frame;
+/// they are mapped into the output frame here so the trace window sits
+/// on the same mask it scans.
 fn generate_stitching(
     mask: &[bool],
     comps: &[Component],
     w: usize,
-    _h: usize,
+    h: usize,
+    sx: f32,
+    sy: f32,
 ) -> Vec<Vec<(f32, f32)>> {
     const INSET: f32 = 8.0; // px inward from the edge
     const MAX_JUMP: usize = 12; // max vertical discontinuity within a run
@@ -2733,17 +2758,30 @@ fn generate_stitching(
         if comp.x1 <= comp.x0 || comp.y1 <= comp.y0 {
             continue;
         }
-        let width = (comp.x1 - comp.x0) as f32;
+        // Photo-frame bbox -> output frame (the same center-scale the
+        // silhouette bitmap went through), clamped to the canvas.
+        let (bx0, by0) =
+            compensate_point(comp.x0 as f32, comp.y0 as f32, w as f32, h as f32, sx, sy);
+        let (bx1, by1) =
+            compensate_point(comp.x1 as f32, comp.y1 as f32, w as f32, h as f32, sx, sy);
+        let x0 = (bx0.max(0.0).min(w as f32)) as usize;
+        let x1 = (bx1.max(0.0).min(w as f32)) as usize;
+        let y0 = (by0.max(0.0).min(h as f32)) as usize;
+        let y1 = (by1.max(0.0).min(h as f32)) as usize;
+        if x1 <= x0 || y1 <= y0 {
+            continue;
+        }
+        let width = (x1 - x0) as f32;
         // Min length scales with component size (cuffs are narrower than hems).
         let min_len = (width * 0.15).max(25.0);
         // Bottom boundary: for each x, the lowest foreground y.
         // Keep ALL runs longer than min_len (hem + cuffs), not just the longest.
         let mut cur: Vec<(f32, f32)> = Vec::new();
         let mut prev_y: Option<usize> = None;
-        for x in comp.x0..comp.x1 {
+        for x in x0..x1 {
             let mut by: Option<usize> = None;
-            let y_lo = comp.y1.saturating_sub(((comp.y1 - comp.y0) / 7).max(20));
-            for y in (y_lo..comp.y1).rev() {
+            let y_lo = y1.saturating_sub(((y1 - y0) / 7).max(20));
+            for y in (y_lo..y1).rev() {
                 if mask[y * w + x] {
                     by = Some(y);
                     break;
@@ -2775,16 +2813,23 @@ fn generate_stitching(
         if std::env::var("IM2VEC_FLAT_DEBUG").is_ok() {
             eprintln!(
                 "stitching: comp ({},{})-({},{}) min_len={:.1}, total paths={}",
-                comp.x0,
-                comp.y0,
-                comp.x1,
-                comp.y1,
+                x0,
+                y0,
+                x1,
+                y1,
                 min_len,
                 out.len()
             );
         }
     }
     out.into_iter().filter(|p| p.len() >= 2).collect()
+}
+
+/// #43: clamp a point to the viewBox. The silhouette bitmap is
+/// canvas-clipped, so linework mapped past its edge would otherwise hang
+/// off-canvas; pinning it to the edge is the backstop.
+fn clamp_viewbox(x: f32, y: f32, w: f32, h: f32) -> (f32, f32) {
+    (x.clamp(0.0, w), y.clamp(0.0, h))
 }
 
 /// Offset a bottom-edge polyline upward (inward) by `d` px.
@@ -3846,5 +3891,101 @@ mod tests {
         let mut buttons: Vec<Button> = (0..5).map(|_| Button { cx: 10.0, cy: 10.0 }).collect();
         snap_front_buttons_to_grid(&mut buttons, 0.0, 100.0, 0.0, 100.0);
         assert!(buttons.iter().all(|b| b.cx == 10.0 && b.cy == 10.0));
+    }
+
+    /// #43: stitching traces the compensated (output-frame) mask, so with
+    /// identity compensation the paths must already sit inside the canvas
+    /// near the component's bottom edge — no further mapping needed.
+    #[test]
+    fn stitching_paths_are_output_frame() {
+        let (w, h) = (200usize, 200usize);
+        let mut mask = vec![false; w * h];
+        for y in 40..160 {
+            for x in 50..150 {
+                mask[y * w + x] = true;
+            }
+        }
+        let bg = Component {
+            area: 0,
+            x0: 0,
+            y0: 0,
+            x1: 0,
+            y1: 0,
+            symmetrized: false,
+        };
+        let comp = Component {
+            area: 100 * 120,
+            x0: 50,
+            y0: 40,
+            x1: 150,
+            y1: 160,
+            symmetrized: false,
+        };
+        let paths = generate_stitching(&mask, &[bg, comp], w, h, 1.0, 1.0);
+        assert!(!paths.is_empty(), "hem run should be found");
+        for p in &paths {
+            for &(x, y) in p {
+                assert!(
+                    x >= 0.0 && x <= w as f32 && y >= 0.0 && y <= h as f32,
+                    "stitch point ({x:.1},{y:.1}) outside viewBox"
+                );
+                // 8px inset above the bottom edge y=159.
+                assert!(
+                    (y - 151.0).abs() < 12.0,
+                    "stitch y={y:.1}, expected near 151"
+                );
+            }
+        }
+    }
+
+    /// #43 regression: when the garment touches the image bottom edge and
+    /// real compensation (1.18, 1.27) applies, emitted stitch paths must
+    /// still lie inside the viewBox. Before the fix they were mapped
+    /// through dpt a second time and landed at y=1150.8 on a 1024 canvas.
+    #[test]
+    fn stitching_stays_in_viewbox_with_compensation() {
+        let (w, h) = (1024usize, 1024usize);
+        let mut mask = vec![false; w * h];
+        // Compensated-frame garment: spans x 0..1023, touches bottom edge.
+        for y in 100..1024 {
+            for x in 0..1024 {
+                mask[y * w + x] = true;
+            }
+        }
+        // Photo-frame bbox that compensates to roughly the mask above.
+        let bg = Component {
+            area: 0,
+            x0: 0,
+            y0: 0,
+            x1: 0,
+            y1: 0,
+            symmetrized: false,
+        };
+        let comp = Component {
+            area: 900 * 900,
+            x0: 60,
+            y0: 60,
+            x1: 964,
+            y1: 1024,
+            symmetrized: false,
+        };
+        let paths = generate_stitching(&mask, &[bg, comp], w, h, 1.18, 1.27);
+        assert!(!paths.is_empty(), "hem run should be found");
+        for p in &paths {
+            for &(x, y) in p {
+                assert!(
+                    x >= 0.0 && x <= w as f32 && y >= 0.0 && y <= h as f32,
+                    "stitch point ({x:.1},{y:.1}) outside 1024 viewBox"
+                );
+            }
+        }
+    }
+
+    /// #43 backstop: clamp_viewbox pins out-of-range points to the edge.
+    #[test]
+    fn clamp_viewbox_pins_to_edge() {
+        assert_eq!(clamp_viewbox(-28.4, 1150.8, 1024.0, 1024.0), (0.0, 1024.0));
+        assert_eq!(clamp_viewbox(500.0, 500.0, 1024.0, 1024.0), (500.0, 500.0));
+        assert_eq!(clamp_viewbox(2000.0, -5.0, 1024.0, 1024.0), (1024.0, 0.0));
     }
 }
