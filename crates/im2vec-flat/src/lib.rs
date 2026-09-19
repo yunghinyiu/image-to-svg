@@ -2276,6 +2276,20 @@ fn refine_pocket_y(buttons: &[Button], x0: f32, y0: f32, x1: f32, y1: f32, defau
     default_y
 }
 
+/// Median x of a detected lapel edge chain as a normalized |u| offset from
+/// the closure center. #33: the lapel template's width is traced from the
+/// photo's detected edge, not a hardcoded constant. Median (not mean) so a
+/// stray hook at either end of the chain can't drag the width.
+fn lapel_edge_u(pts: &[(f32, f32)], cx: f32, w: f32) -> f32 {
+    if pts.is_empty() || w <= 0.0 {
+        return 0.26;
+    }
+    let mut xs: Vec<f32> = pts.iter().map(|&(x, _)| x).collect();
+    xs.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let median = xs[xs.len() / 2];
+    ((median - cx) / w).abs()
+}
+
 /// Render a [`Template`] through a [`Placement`] and append the resulting
 /// paths to the solid / dashed accumulators, preserving template path order.
 fn push_rendered(
@@ -2426,16 +2440,21 @@ fn generate_structure(
         // Lapel/collar/gorge render only when the photo shows lapel
         // structure (the detected lapel edge pair): a new garment without
         // lapels must not get a blazer template drawn on it.
-        if lapel_pair.is_some() {
+        if let Some(lp) = &lapel_pair {
             for mirror in [true, false] {
                 let side_frame = Placement {
                     mirror,
                     ..lapel_frame
                 };
-                // Template lapel: break -> notch -> peak -> brk.
-                // Placement is photo-driven (detector vg + edge search);
-                // shape work continues in template.rs.
-                let lapel = lapel_template_with_peak(vg, vb, 0.20);
+                // #33: trace the lapel width from the detected edge chain —
+                // left and right measured independently (the photo is not
+                // perfectly symmetric). The notch starts where the collar
+                // ends (gorge seam's outer end, u=0.14). Placement stays
+                // photo-driven (detector vg + edge search).
+                let chain_idx = if mirror { lp.left_idx } else { lp.right_idx };
+                let edge_u = lapel_edge_u(&chains[chain_idx], cx, w).clamp(0.10, 0.45);
+                // Template lapel: notch step -> straight outer edge -> roll.
+                let lapel = lapel_template_with_peak(vg, vb, 0.14, edge_u);
                 push_rendered(&mut solid, &mut dashed, &lapel, &side_frame);
                 // Gorge seam (drawn once)
                 if mirror {
