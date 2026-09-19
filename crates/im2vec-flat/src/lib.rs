@@ -28,7 +28,7 @@ pub mod shading;
 mod template;
 use template::{
     back_collar_template, front_collar_template, gorge_seam_template, lapel_template_with_peak,
-    neckline_template, pocket_template, render_template, Placement, Template,
+    neckline_template, pocket_template, render_template, sample_armhole_curve, Placement, Template,
 };
 
 /// Max image side in px; larger inputs are downscaled for speed.
@@ -2513,6 +2513,36 @@ fn generate_structure(
             }
         }
 
+        // Armholes (armscye): curved solid seam from each shoulder tip to
+        // its underarm pit, traced from the photo's inward-curving chain
+        // pair. Detector-gated like pockets and lapels: sleeveless
+        // garments get no pair and no armhole linework. Runs for buttoned
+        // and buttonless fronts alike (a tee has armholes but no lapels).
+        let armhole = detect::detect_armhole(chains, &view, cx, mask, img_w, img_h)
+            .filter(|a| a.confidence >= detect::DETECT_CONFIDENCE_MIN);
+        if std::env::var("IM2VEC_FLAT_DEBUG").is_ok() {
+            match armhole {
+                Some(a) => eprintln!(
+                    "[detect] armhole tip=({:.0},{:.0})/({:.0},{:.0}) pit=({:.0},{:.0})/({:.0},{:.0}) (conf {:.2})",
+                    a.left.tip.0,
+                    a.left.tip.1,
+                    a.right.tip.0,
+                    a.right.tip.1,
+                    a.left.pit.0,
+                    a.left.pit.1,
+                    a.right.pit.0,
+                    a.right.pit.1,
+                    a.confidence
+                ),
+                None => eprintln!("[detect] no armhole pair — skipping armhole seams"),
+            }
+        }
+        if let Some(a) = armhole {
+            for side in [&a.left, &a.right] {
+                solid.push(sample_armhole_curve(side.tip, side.pit, 24));
+            }
+        }
+
         // Buttonless fronts: neckline/collar structure traced from the
         // photo. Buttoned garments take the lapel/pocket path above instead.
         // Rendered only when the detector fires — no phantom necklines.
@@ -2610,6 +2640,33 @@ fn generate_structure(
             None => {
                 // Fallback to fixed template if no neckline detected.
                 push_rendered(&mut solid, &mut dashed, &back_collar_template(), &frame);
+            }
+        }
+        // Back armholes: same detector, gated the same way. The target
+        // draws the armscye on the back view too.
+        let back_cx = frame.ax;
+        let back_armhole = detect::detect_armhole(chains, &view, back_cx, mask, img_w, img_h)
+            .filter(|a| a.confidence >= detect::DETECT_CONFIDENCE_MIN);
+        if std::env::var("IM2VEC_FLAT_DEBUG").is_ok() {
+            match back_armhole {
+                Some(a) => eprintln!(
+                    "[detect] back armhole tip=({:.0},{:.0})/({:.0},{:.0}) pit=({:.0},{:.0})/({:.0},{:.0}) (conf {:.2})",
+                    a.left.tip.0,
+                    a.left.tip.1,
+                    a.right.tip.0,
+                    a.right.tip.1,
+                    a.left.pit.0,
+                    a.left.pit.1,
+                    a.right.pit.0,
+                    a.right.pit.1,
+                    a.confidence
+                ),
+                None => eprintln!("[detect] back: no armhole pair — skipping armhole seams"),
+            }
+        }
+        if let Some(a) = back_armhole {
+            for side in [&a.left, &a.right] {
+                solid.push(sample_armhole_curve(side.tip, side.pit, 24));
             }
         }
     }

@@ -884,6 +884,253 @@ pub fn detect_pocket_flaps(
     })
 }
 
+/// Top edge of the mask at column `x`, scanning up from `y_from`: the last
+/// foreground y before the background (or `y_to` if the column stays
+/// foreground). Used to snap detected landmarks onto the silhouette.
+fn mask_top_at_x(mask: &[bool], img_w: usize, img_h: usize, x: f32, y_from: f32, y_to: f32) -> f32 {
+    if mask.len() != img_w * img_h || img_w == 0 || img_h == 0 {
+        return y_from;
+    }
+    let xi = (x.round().clamp(0.0, img_w as f32 - 1.0)) as usize;
+    let mut y = y_from.round().clamp(0.0, img_h as f32 - 1.0);
+    let stop = y_to.round().clamp(0.0, img_h as f32 - 1.0);
+    let mut last_fg = y;
+    while y >= stop {
+        if mask[(y as usize) * img_w + xi] {
+            last_fg = y;
+        } else {
+            break;
+        }
+        if y <= 0.0 {
+            break;
+        }
+        y -= 1.0;
+    }
+    last_fg
+}
+
+/// A detected armhole (armscye) side: shoulder tip and underarm pit, both
+/// photo-measured. The tip is the topmost armhole-chain point snapped up to
+/// the silhouette; the pit is the inboard-most chain point in the armhole
+/// band (where the inward curve meets the side seam).
+#[derive(Clone, Copy, Debug)]
+pub struct ArmholeSide {
+    pub tip: (f32, f32),
+    pub pit: (f32, f32),
+    pub confidence: f32,
+}
+
+/// A symmetric armhole pair about the view axis.
+#[derive(Clone, Copy, Debug)]
+pub struct Armhole {
+    pub left: ArmholeSide,
+    pub right: ArmholeSide,
+    pub confidence: f32,
+}
+
+/// Minimum chain arc length (px) for an armhole candidate.
+const ARMHOLE_MIN_ARC: f32 = 45.0;
+/// Minimum net downward travel (px) of a candidate chain.
+const ARMHOLE_MIN_DROP: f32 = 35.0;
+/// Maximum upward snap (px) when seating the shoulder tip on the
+/// silhouette. The tip only corrects small chain/silhouette offsets; a
+/// point deep inside the garment must not snap to the view top.
+const ARMHOLE_MAX_TIP_SNAP: f32 = 25.0;
+/// Maximum endpoint gap (px) when following an armhole chain down to its
+/// continuation. Catches fragmented seams (blazer chain 8 -> 21, 52px)
+/// while excluding nearby folds (chain 27 sits 98px above chain 17's end).
+const ARMHOLE_FOLLOW_GAP: f32 = 60.0;
+
+/// Shared inputs for armhole detection on one view.
+struct ArmholeInput<'a> {
+    feats: &'a [ChainFeat],
+    chains: &'a [Vec<(f32, f32)>],
+    view: &'a ViewContext,
+    cx: f32,
+    mask: &'a [bool],
+    img_w: usize,
+    img_h: usize,
+}
+
+/// An armhole candidate chain, reduced to its endpoints and arc.
+struct ArmholeCand {
+    idx: usize,
+    top: (f32, f32),
+    bottom: (f32, f32),
+    arc: f32,
+}
+
+/// Detect one armhole side. `side` is -1.0 for the left (x < cx) side, +1.0
+/// for the right. Returns the side detection with its confidence.
+///
+/// The armhole is traced by following chains: start from the topmost
+/// substantial chain in the side band (the shoulder tip), then hop to the
+/// nearest chain below (catching fragmented seams) until the trail ends.
+/// The pit is the bottom of that trail — measured, never the inboard-most
+/// point of unrelated chains.
+fn detect_armhole_side(inp: &ArmholeInput, side: f32) -> Option<ArmholeSide> {
+    let (feats, chains, view, cx, mask, img_w, img_h) = (
+        inp.feats, inp.chains, inp.view, inp.cx, inp.mask, inp.img_w, inp.img_h,
+    );
+    let w = view.w();
+    let h = view.h();
+    // Side band, kept clear of the center front: lapels, princess seams,
+    // and plackets live inside 0.18w; the armscye lives outboard of them.
+    let x_lo = cx + side * 0.18 * w;
+    let x_hi = cx + side * 0.48 * w;
+    let (x_lo, x_hi) = (x_lo.min(x_hi), x_lo.max(x_hi));
+    let y_lo = view.y0 + 0.03 * h;
+    let y_hi = view.y0 + 0.50 * h;
+    let mut cands: Vec<ArmholeCand> = Vec::new();
+    for f in feats {
+        if f.cx < x_lo || f.cx > x_hi || f.cy < y_lo || f.cy > y_hi {
+            continue;
+        }
+        if f.arc_len < ARMHOLE_MIN_ARC {
+            continue;
+        }
+        let c = match chains.get(f.idx) {
+            Some(c) if !c.is_empty() => c,
+            _ => continue,
+        };
+        // Chains store points in arbitrary order; use the y-extreme points.
+        let top = c
+            .iter()
+            .min_by(|a, b| a.1.partial_cmp(&b.1).unwrap())
+            .copied()
+            .unwrap();
+        let bottom = c
+            .iter()
+            .max_by(|a, b| a.1.partial_cmp(&b.1).unwrap())
+            .copied()
+            .unwrap();
+        if bottom.1 - top.1 < ARMHOLE_MIN_DROP {
+            continue;
+        }
+        cands.push(ArmholeCand {
+            idx: f.idx,
+            top,
+            bottom,
+            arc: f.arc_len,
+        });
+    }
+    if cands.is_empty() {
+        return None;
+    }
+    // Tip chain: the highest top. The armhole starts at the shoulder.
+    cands.sort_by(|a, b| a.top.1.partial_cmp(&b.top.1).unwrap());
+    let tip_cand = &cands[0];
+    // Shoulder tip: topmost point, snapped up to the silhouette so the
+    // rendered curve starts on the garment edge, not floating inside.
+    // Distance-limited: a point deep inside the garment keeps its measured
+    // position instead of jumping to the view top.
+    let snapped_y = mask_top_at_x(mask, img_w, img_h, tip_cand.top.0, tip_cand.top.1, view.y0);
+    let tip = if tip_cand.top.1 - snapped_y <= ARMHOLE_MAX_TIP_SNAP {
+        (tip_cand.top.0, snapped_y)
+    } else {
+        tip_cand.top
+    };
+    // Follow the trail down: hop to the nearest chain whose top sits just
+    // below the current bottom. This joins fragmented seams (8 -> 21) but
+    // will not leap to a fold floating above the trail's end (27).
+    let mut used = vec![tip_cand.idx];
+    let mut bottom = tip_cand.bottom;
+    let mut total_arc = tip_cand.arc;
+    loop {
+        let next = cands
+            .iter()
+            .filter(|c| !used.contains(&c.idx))
+            .map(|c| {
+                let d = ((c.top.0 - bottom.0).powi(2) + (c.top.1 - bottom.1).powi(2)).sqrt();
+                (c, d)
+            })
+            .filter(|(c, d)| {
+                *d < ARMHOLE_FOLLOW_GAP
+                    && c.top.1 >= bottom.1 - 30.0
+                    && c.top.1 <= view.y0 + 0.60 * h
+            })
+            .min_by(|a, b| a.1.partial_cmp(&b.1).unwrap());
+        match next {
+            Some((c, _)) => {
+                used.push(c.idx);
+                bottom = c.bottom;
+                total_arc += c.arc;
+            }
+            None => break,
+        }
+        if used.len() >= 4 {
+            break;
+        }
+    }
+    // Underarm pit: the bottom of the measured trail.
+    let pit = bottom;
+    // Gates: the pit must sit well below the tip (an armhole has real
+    // vertical extent) and above the lower band edge (a full-height side
+    // seam is not an armhole). Direction is lenient: a nearly vertical
+    // trail is still an armhole, but a strongly outward one is a sleeve
+    // outer edge.
+    if pit.1 - tip.1 < 0.15 * h {
+        return None;
+    }
+    if pit.1 > view.y0 + 0.65 * h {
+        return None;
+    }
+    if -side * (pit.0 - tip.0) < -10.0 {
+        return None;
+    }
+    let support = (total_arc / (0.35 * h)).min(1.0);
+    let shape = ((pit.1 - tip.1) / (0.25 * h)).min(1.0);
+    let confidence = (0.6 * support + 0.4 * shape).min(1.0);
+    Some(ArmholeSide {
+        tip,
+        pit,
+        confidence,
+    })
+}
+
+/// Armhole (armscye) pair: the curved seam from each shoulder tip to its
+/// underarm pit. Both sides must detect — symmetry about the view axis is a
+/// first-class signal, and a lone inward-curving chain is more likely a
+/// wrinkle or pocket edge than an armhole. Sleeveless garments, bottoms,
+/// and the side view produce no pair and get no armhole linework.
+pub fn detect_armhole(
+    chains: &[Vec<(f32, f32)>],
+    view: &ViewContext,
+    cx: f32,
+    mask: &[bool],
+    img_w: usize,
+    img_h: usize,
+) -> Option<Armhole> {
+    let feats = chain_features(chains);
+    let inp = ArmholeInput {
+        feats: &feats,
+        chains,
+        view,
+        cx,
+        mask,
+        img_w,
+        img_h,
+    };
+    let left = detect_armhole_side(&inp, -1.0)?;
+    let right = detect_armhole_side(&inp, 1.0)?;
+    // Symmetry: tip and pit distances from the axis should mirror.
+    let w = view.w().max(1.0);
+    let tip_sym =
+        1.0 - (((cx - left.tip.0) - (right.tip.0 - cx)).abs() / (0.25 * w)).clamp(0.0, 1.0);
+    let pit_sym =
+        1.0 - (((cx - left.pit.0) - (right.pit.0 - cx)).abs() / (0.25 * w)).clamp(0.0, 1.0);
+    let confidence =
+        0.5 * (0.5 * tip_sym + 0.5 * pit_sym) + 0.25 * left.confidence + 0.25 * right.confidence;
+    if confidence < DETECT_CONFIDENCE_MIN {
+        return None;
+    }
+    Some(Armhole {
+        left,
+        right,
+        confidence,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1365,5 +1612,125 @@ mod tests {
         }
         let view = ViewContext::new(0.0, 0.0, 200.0, 400.0);
         assert!(!has_separated_legs(&m, 200, 400, &view));
+    }
+
+    // ---- armhole (armscye) detection ----
+
+    /// Synthetic armhole pair: left chain goes down and inward (toward
+    /// cx=200), right chain mirrors it. Both curved, not straight.
+    fn armhole_chains() -> Vec<Vec<(f32, f32)>> {
+        vec![
+            vec![
+                (60.0, 60.0),
+                (62.0, 90.0),
+                (68.0, 120.0),
+                (78.0, 150.0),
+                (90.0, 175.0),
+            ],
+            vec![
+                (340.0, 60.0),
+                (338.0, 90.0),
+                (332.0, 120.0),
+                (322.0, 150.0),
+                (310.0, 175.0),
+            ],
+        ]
+    }
+
+    /// Mask covering the view's upper-left/right (so tip snap-up works).
+    fn armhole_mask() -> Vec<bool> {
+        let (w, h) = (400usize, 500usize);
+        let mut m = vec![false; w * h];
+        for y in 40..400 {
+            for x in 40..360 {
+                m[y * w + x] = true;
+            }
+        }
+        m
+    }
+
+    #[test]
+    fn armhole_detects_synthetic_pair() {
+        let view = ViewContext::new(0.0, 0.0, 400.0, 500.0);
+        let a = detect_armhole(&armhole_chains(), &view, 200.0, &armhole_mask(), 400, 500)
+            .expect("armhole pair");
+        // Tips at the top of the chains, snapped up to the mask top (y=40).
+        assert!((a.left.tip.0 - 60.0).abs() < 2.0, "tip={:?}", a.left.tip);
+        assert!((a.left.tip.1 - 40.0).abs() < 2.0, "tip={:?}", a.left.tip);
+        assert!((a.right.tip.0 - 340.0).abs() < 2.0, "tip={:?}", a.right.tip);
+        // Pits inboard of the tips and well below them.
+        assert!(a.left.pit.0 > a.left.tip.0, "pit={:?}", a.left.pit);
+        assert!(a.right.pit.0 < a.right.tip.0, "pit={:?}", a.right.pit);
+        assert!(a.left.pit.1 - a.left.tip.1 > 60.0);
+        assert!(
+            a.confidence >= DETECT_CONFIDENCE_MIN,
+            "conf={}",
+            a.confidence
+        );
+    }
+
+    #[test]
+    fn armhole_rejects_single_side() {
+        // Only the left chain: no pair, no detection.
+        let view = ViewContext::new(0.0, 0.0, 400.0, 500.0);
+        let chains = vec![armhole_chains()[0].clone()];
+        assert!(detect_armhole(&chains, &view, 200.0, &armhole_mask(), 400, 500).is_none());
+    }
+
+    #[test]
+    fn armhole_rejects_outward_chains() {
+        // Sleeve outer edges: go down and OUTWARD (away from the axis).
+        // Same symmetry, wrong direction — not armholes.
+        let view = ViewContext::new(0.0, 0.0, 400.0, 500.0);
+        let chains = vec![
+            vec![(100.0, 60.0), (90.0, 100.0), (80.0, 140.0), (70.0, 180.0)],
+            vec![
+                (300.0, 60.0),
+                (310.0, 100.0),
+                (320.0, 140.0),
+                (330.0, 180.0),
+            ],
+        ];
+        assert!(detect_armhole(&chains, &view, 200.0, &armhole_mask(), 400, 500).is_none());
+    }
+
+    #[test]
+    fn armhole_rejects_straight_side_seam() {
+        // Long vertical trails that run past the underarm into the lower
+        // body: side seams, not armholes (the 0.65h pit gate rejects). A
+        // short vertical trail in the upper band is armhole-like (the
+        // blazer's right armhole is nearly vertical) and must NOT be
+        // rejected — only the over-long trail is.
+        let view = ViewContext::new(0.0, 0.0, 400.0, 500.0);
+        let chains = vec![
+            vec![
+                (100.0, 60.0),
+                (101.0, 180.0),
+                (102.0, 290.0),
+                (103.0, 400.0),
+            ],
+            vec![
+                (300.0, 60.0),
+                (299.0, 180.0),
+                (298.0, 290.0),
+                (297.0, 400.0),
+            ],
+        ];
+        assert!(detect_armhole(&chains, &view, 200.0, &armhole_mask(), 400, 500).is_none());
+    }
+
+    #[test]
+    fn armhole_none_without_chains() {
+        let view = ViewContext::new(0.0, 0.0, 400.0, 500.0);
+        let empty: Vec<Vec<(f32, f32)>> = vec![];
+        assert!(detect_armhole(&empty, &view, 200.0, &armhole_mask(), 400, 500).is_none());
+    }
+
+    #[test]
+    fn mask_top_at_x_snaps_to_silhouette() {
+        // Foreground y 40..400 at x=120: scanning up from y=100 stops at 40.
+        assert!((mask_top_at_x(&armhole_mask(), 400, 500, 120.0, 100.0, 0.0) - 40.0).abs() < 1e-6);
+        // Background column: returns the start y unchanged.
+        assert!((mask_top_at_x(&armhole_mask(), 400, 500, 10.0, 100.0, 0.0) - 100.0).abs() < 1e-6);
     }
 }
