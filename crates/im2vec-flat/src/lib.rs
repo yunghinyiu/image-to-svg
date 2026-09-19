@@ -1594,21 +1594,39 @@ fn snap_front_buttons_to_grid(buttons: &mut [Button], x0: f32, x1: f32, y0: f32,
         }
         rows.push(pair);
     }
-    // Grid lines: column x = mean of column, row y = mean of row.
-    let col_x = [
-        rows.iter().map(|r| buttons[r[0]].cx).sum::<f32>() / 3.0,
-        rows.iter().map(|r| buttons[r[1]].cx).sum::<f32>() / 3.0,
-    ];
+    // #35: fit each column's x as a LINEAR function of y (least squares),
+    // not a single column mean. The photo's button columns genuinely converge
+    // toward the waist (wider top row); a column mean destroys that and drags
+    // the top row inward, away from both the photo evidence and the artist's
+    // drawing. A shared linear model regularizes detection noise while
+    // preserving the measured row widths. Row y = mean of row (rows are
+    // already level in the photo; this just removes sub-pixel jitter).
     let row_y: Vec<f32> = rows
         .iter()
         .map(|r| (buttons[r[0]].cy + buttons[r[1]].cy) / 2.0)
         .collect();
-    for (r, row) in rows.iter().enumerate() {
-        for (c, &bi) in row.iter().enumerate() {
-            buttons[bi].cx = col_x[c];
-            buttons[bi].cy = row_y[r];
+    for c in 0..2 {
+        let xs: Vec<f32> = rows.iter().map(|r| buttons[r[c]].cx).collect();
+        let (a, b) = linfit(&row_y, &xs);
+        for (r, row) in rows.iter().enumerate() {
+            buttons[row[c]].cx = a + b * row_y[r];
+            buttons[row[c]].cy = row_y[r];
         }
     }
+}
+
+/// Least-squares fit of y = a + b*x over n points. Returns (a, b).
+fn linfit(xs: &[f32], ys: &[f32]) -> (f32, f32) {
+    let n = xs.len() as f32;
+    let (mx, my) = (xs.iter().sum::<f32>() / n, ys.iter().sum::<f32>() / n);
+    let sxx = xs.iter().map(|x| (x - mx) * (x - mx)).sum::<f32>();
+    let sxy = xs
+        .iter()
+        .zip(ys.iter())
+        .map(|(x, y)| (x - mx) * (y - my))
+        .sum::<f32>();
+    let b = if sxx > 1e-9 { sxy / sxx } else { 0.0 };
+    (my - b * mx, b)
 }
 
 /// Detect buttons in the photo: gold-chroma round blobs inside the garment
@@ -3598,5 +3616,74 @@ mod tests {
             .filter(|&&(_, y)| (y - 141.0).abs() < 40.0)
             .count();
         assert!(near > 0, "no neckline points near y=141");
+    }
+
+    #[test]
+    fn snap_front_buttons_preserves_converging_columns() {
+        // Blazer-like 2x3 grid: columns converge toward the waist (wider
+        // top row). The old column-mean snap collapsed every row to the
+        // same width, dragging the top row inward; the linear column fit
+        // must preserve the measured row widths (#35).
+        let mut buttons = vec![
+            Button {
+                cx: 360.5,
+                cy: 425.5,
+            },
+            Button {
+                cx: 463.0,
+                cy: 425.5,
+            },
+            Button {
+                cx: 373.0,
+                cy: 492.0,
+            },
+            Button {
+                cx: 451.5,
+                cy: 493.5,
+            },
+            Button {
+                cx: 373.0,
+                cy: 564.5,
+            },
+            Button {
+                cx: 449.0,
+                cy: 566.5,
+            },
+        ];
+        snap_front_buttons_to_grid(&mut buttons, 162.0, 661.0, 128.0, 712.0);
+        // Rows level at row means.
+        let row_y = [425.5, 492.75, 565.5];
+        for (r, &y) in row_y.iter().enumerate() {
+            let pair: Vec<&Button> = buttons.iter().filter(|b| (b.cy - y).abs() < 0.01).collect();
+            assert_eq!(pair.len(), 2, "row {r} not level at {y}");
+        }
+        // Top row wider than bottom row (converging columns preserved).
+        let width = |y: f32| {
+            let xs: Vec<f32> = buttons
+                .iter()
+                .filter(|b| (b.cy - y).abs() < 0.01)
+                .map(|b| b.cx)
+                .collect();
+            xs.iter().fold(f32::NEG_INFINITY, |a, &b| a.max(b))
+                - xs.iter().fold(f32::INFINITY, |a, &b| a.min(b))
+        };
+        let w_top = width(425.5);
+        let w_bot = width(565.5);
+        assert!(
+            w_top > w_bot + 5.0,
+            "top row width {w_top:.1} should exceed bottom {w_bot:.1}"
+        );
+        // And specifically wider than the old column-mean width (85.7).
+        assert!(
+            w_top > 90.0,
+            "top row collapsed toward column mean: {w_top:.1}"
+        );
+    }
+
+    #[test]
+    fn snap_front_buttons_ignores_non_six() {
+        let mut buttons: Vec<Button> = (0..5).map(|_| Button { cx: 10.0, cy: 10.0 }).collect();
+        snap_front_buttons_to_grid(&mut buttons, 0.0, 100.0, 0.0, 100.0);
+        assert!(buttons.iter().all(|b| b.cx == 10.0 && b.cy == 10.0));
     }
 }
