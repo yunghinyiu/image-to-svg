@@ -2513,6 +2513,9 @@ fn generate_structure(
 
     // Back view: collar band + center back seam. The frame axis comes from
     // mask moments (no buttons on a back view) instead of the bbox center.
+    // #36: Anchor the collar to the DETECTED neckline (not fixed template
+    // coords) so it follows the photo's neck curve and connects to the
+    // shoulders instead of floating as a detached trapezoid.
     if let Some(bi) = back_idx {
         let c = &comps[bi];
         let (x0, y0, x1, y1) = (c.x0 as f32, c.y0 as f32, c.x1 as f32, c.y1 as f32);
@@ -2526,7 +2529,52 @@ fn generate_structure(
             h,
             mirror: false,
         };
-        push_rendered(&mut solid, &mut dashed, &back_collar_template(), &frame);
+        // Try to detect the neckline seam; draw an evidence-anchored collar.
+        let neckline = detect::detect_neckline(chains, &view, mask, img_w, img_h)
+            .filter(|n| n.confidence >= detect::DETECT_CONFIDENCE_MIN);
+        if std::env::var("IM2VEC_FLAT_DEBUG").is_ok() {
+            match &neckline {
+                Some(n) => eprintln!(
+                    "[detect] back neckline y={:.1} x={:.0}-{:.0} depth={:.0} (conf {:.2})",
+                    n.y, n.x0, n.x1, n.depth, n.confidence
+                ),
+                None => eprintln!("[detect] back: no neckline — using fixed collar template"),
+            }
+        }
+        match neckline {
+            Some(n) => {
+                // Collar band: bottom edge sits ON the detected neckline seam
+                // (x0-x1, y), top edge is above with a gentle curve following
+                // the neck. Height is proportional to the detected bow depth
+                // (min 12px so it's visible even on shallow necklines).
+                let collar_h = (n.depth + 18.0).max(12.0);
+                let top_y = n.y - collar_h;
+                let cx = (n.x0 + n.x1) / 2.0;
+                // Slight inset for the top edge (collar is narrower at top).
+                let inset = (n.x1 - n.x0) * 0.06;
+                // Bottom edge (on the seam).
+                solid.push(vec![(n.x0, n.y), (cx, n.y + n.depth * 0.3), (n.x1, n.y)]);
+                // Top edge (curved, following neck).
+                solid.push(vec![
+                    (n.x0 + inset, top_y + 4.0),
+                    (cx, top_y),
+                    (n.x1 - inset, top_y + 4.0),
+                ]);
+                // Sides connecting top to bottom.
+                solid.push(vec![(n.x0 + inset, top_y + 4.0), (n.x0, n.y)]);
+                solid.push(vec![(n.x1 - inset, top_y + 4.0), (n.x1, n.y)]);
+                // Dashed topstitching along the bottom edge (on the seam).
+                dashed.push(vec![
+                    (n.x0, n.y - 4.0),
+                    (cx, n.y - 4.0 + n.depth * 0.3),
+                    (n.x1, n.y - 4.0),
+                ]);
+            }
+            None => {
+                // Fallback to fixed template if no neckline detected.
+                push_rendered(&mut solid, &mut dashed, &back_collar_template(), &frame);
+            }
+        }
     }
 
     (solid, dashed)
